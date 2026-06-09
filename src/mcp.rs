@@ -49,13 +49,13 @@ pub fn run_server(db: Database) {
     let reader = BufReader::new(stdin.lock());
     let mut state = MCPState::new();
 
-    eprintln!("mneme: MCP server ready");
+    eprintln!("mimir: MCP server ready");
 
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("mneme: stdin read error: {}", e);
+                eprintln!("mimir: stdin read error: {}", e);
                 break;
             }
         };
@@ -67,7 +67,7 @@ pub fn run_server(db: Database) {
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("mneme: JSON parse error: {} in line: {}", e, line);
+                eprintln!("mimir: JSON parse error: {} in line: {}", e, line);
                 // Try to send a parse error if we can extract an id
                 let error_response = json!({
                     "jsonrpc": "2.0",
@@ -120,7 +120,7 @@ fn handle_request(
                 result: Some(json!({
                     "protocolVersion": "2025-06-18",
                     "serverInfo": {
-                        "name": "mneme",
+                        "name": "mimir",
                         "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
@@ -150,7 +150,7 @@ fn handle_request(
                 result: Some(json!({
                     "tools": [
                         {
-                            "name": "mneme_recall",
+                            "name": "mimir_recall",
                             "description": "Search memories with hybrid keyword+vector search",
                             "inputSchema": {
                                 "type": "object",
@@ -196,7 +196,7 @@ fn handle_request(
                             }
                         },
                         {
-                            "name": "mneme_store",
+                            "name": "mimir_store",
                             "description": "Store a new memory",
                             "inputSchema": {
                                 "type": "object",
@@ -243,7 +243,7 @@ fn handle_request(
                             }
                         },
                         {
-                            "name": "mneme_health",
+                            "name": "mimir_health",
                             "description": "Check server and database health",
                             "inputSchema": {
                                 "type": "object",
@@ -274,15 +274,15 @@ fn handle_request(
             let tool_args = params.get("arguments").cloned().unwrap_or(json!({}));
 
             let result_text = match tool_name {
-                "mneme_recall" => match tools::handle_recall(db, tool_args) {
+                "mimir_recall" => match tools::handle_recall(db, tool_args) {
                     Ok(text) => text,
                     Err(e) => return Some(error_response(id, -32603, &e)),
                 },
-                "mneme_store" => match tools::handle_store(db, tool_args) {
+                "mimir_store" => match tools::handle_store(db, tool_args) {
                     Ok(text) => text,
                     Err(e) => return Some(error_response(id, -32603, &e)),
                 },
-                "mneme_health" => tools::handle_health(db),
+                "mimir_health" => tools::handle_health(db),
                 _ => {
                     return Some(error_response(
                         id,

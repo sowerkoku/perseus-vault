@@ -1,14 +1,14 @@
-# Mneme
+# Mimir
 
 > Persistent memory for AI agents. SQLite + FTS5. MCP-native. Fully local.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
 
-## What is Mneme?
+## What is Mimir?
 
-Mneme is a lightweight **MCP JSON-RPC 2.0 stdio server** that gives AI agents durable
-memory across sessions. Agents store facts they learn, and Mneme recalls them when
+Mimir is a lightweight **MCP JSON-RPC 2.0 stdio server** that gives AI agents durable
+memory across sessions. Agents store facts they learn, and Mimir recalls them when
 needed — so the agent doesn't start from zero every time.
 
 It uses **SQLite with full-text search (FTS5)**. No API keys, no embeddings model, no
@@ -22,11 +22,11 @@ Works with any MCP host: Claude Desktop, Cursor, OpenClaw, Hermes Agent, etc.
 
 ### Option 1: One-shot bootstrap
 
-A single command that installs Rust (if needed), builds Mneme from source, and sets
+A single command that installs Rust (if needed), builds Mimir from source, and sets
 everything up:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/tcconnally/mneme/main/scripts/bootstrap.sh | bash
+curl -sSL https://raw.githubusercontent.com/tcconnally/mimir/main/scripts/bootstrap.sh | bash
 ```
 
 Idempotent — safe to re-run. Set `FORCE=1` to force a rebuild.
@@ -34,10 +34,10 @@ Idempotent — safe to re-run. Set `FORCE=1` to force a rebuild.
 ### Option 2: Build from source
 
 ```bash
-git clone https://github.com/tcconnally/mneme.git
-cd mneme
+git clone https://github.com/tcconnally/mimir.git
+cd mimir
 cargo build --release
-cp target/release/mneme ~/.local/bin/
+cp target/release/mimir ~/.local/bin/
 ```
 
 **Requirements:** Rust 1.70+ (stable), a C compiler (rusqlite bundles SQLite).
@@ -46,7 +46,7 @@ cp target/release/mneme ~/.local/bin/
 
 ## MCP Configuration
 
-Add Mneme as an MCP server in your host's config. Pick your tool:
+Add Mimir as an MCP server in your host's config. Pick your tool:
 
 ### Claude Desktop
 
@@ -55,9 +55,9 @@ Add Mneme as an MCP server in your host's config. Pick your tool:
 ```json
 {
   "mcpServers": {
-    "mneme": {
-      "command": "mneme",
-      "args": ["--db", "/home/YOU/.mneme/data/mneme.db"]
+    "mimir": {
+      "command": "mimir",
+      "args": ["--db", "/home/YOU/.mimir/data/mimir.db"]
     }
   }
 }
@@ -70,9 +70,9 @@ Add Mneme as an MCP server in your host's config. Pick your tool:
 ```json
 {
   "mcpServers": {
-    "mneme": {
-      "command": "mneme",
-      "args": ["--db", "/home/YOU/.mneme/data/mneme.db"]
+    "mimir": {
+      "command": "mimir",
+      "args": ["--db", "/home/YOU/.mimir/data/mimir.db"]
     }
   }
 }
@@ -85,9 +85,9 @@ In your OpenClaw MCP config:
 ```json
 {
   "mcpServers": {
-    "mneme": {
-      "command": "mneme",
-      "args": ["--db", "/home/YOU/.mneme/data/mneme.db"]
+    "mimir": {
+      "command": "mimir",
+      "args": ["--db", "/home/YOU/.mimir/data/mimir.db"]
     }
   }
 }
@@ -99,9 +99,9 @@ In your OpenClaw MCP config:
 
 ```yaml
 mcp_servers:
-  mneme:
-    command: "mneme"
-    args: ["--db", "~/.mneme/data/mneme.db"]
+  mimir:
+    command: "mimir"
+    args: ["--db", "~/.mimir/data/mimir.db"]
 ```
 
 ---
@@ -110,9 +110,9 @@ mcp_servers:
 
 | Tool | Description |
 |------|-------------|
-| `mneme_store` | Store a memory with content, type (`insight`/`architecture`/`decision`), tags, and importance |
-| `mneme_recall` | Search memories by keyword query (FTS5 + LIKE fallback), filtered by type, workspace, topic |
-| `mneme_health` | Check server and database health |
+| `mimir_store` | Store a memory with content, type (`insight`/`architecture`/`decision`), tags, and importance |
+| `mimir_recall` | Search memories by keyword query (FTS5 + LIKE fallback), filtered by type, workspace, topic |
+| `mimir_health` | Check server and database health |
 
 ### Key Properties
 
@@ -129,30 +129,30 @@ mcp_servers:
 ### Start the MCP server
 
 ```bash
-mneme --db ~/.mneme/data/mneme.db
+mimir --db ~/.mimir/data/mimir.db
 ```
 
-The legacy `mneme serve --db ... --mcp` form still works for older MCP host
+The legacy `mimir serve --db ... --mcp` form still works for older MCP host
 configs. The `--mcp` flag is deprecated because stdio MCP mode is always on.
 
 ### Show version
 
 ```bash
-mneme --version
+mimir --version
 ```
 
 ### Override database path
 
 ```bash
-export MNEME_DB_PATH=/custom/path/mneme.db
-mneme
+export MNEME_DB_PATH=/custom/path/mimir.db
+mimir
 ```
 
 ### Manual MCP testing
 
 ```bash
 # Pipe JSON-RPC directly
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | mneme --db /tmp/test.db
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | mimir --db /tmp/test.db
 ```
 
 ---
@@ -175,7 +175,7 @@ CREATE TABLE memories (
     workspace_hash TEXT DEFAULT '',
     tags TEXT DEFAULT '{}',
     links TEXT DEFAULT '[]',
-    source TEXT DEFAULT 'mneme',
+    source TEXT DEFAULT 'mimir',
     verified INTEGER DEFAULT 0
 );
 
@@ -186,7 +186,7 @@ CREATE VIRTUAL TABLE memories_fts USING fts5(content, content_rowid='rowid');
 
 ## Offline
 
-Mneme is fully offline after build. No telemetry, no API calls, no network requests —
+Mimir is fully offline after build. No telemetry, no API calls, no network requests —
 ever. The binary never dials home. You own every byte.
 
 ---
@@ -208,16 +208,16 @@ ever. The binary never dials home. You own every byte.
 
 ---
 
-## Using Mneme with Perseus
+## Using Mimir with Perseus
 
-Mneme is also the default memory backend for [Perseus](https://github.com/tcconnally/perseus),
+Mimir is also the default memory backend for [Perseus](https://github.com/tcconnally/perseus),
 a live context engine for AI agents. If you use Perseus, add to `.perseus/config.yaml`:
 
 ```yaml
-mneme:
+mimir:
   enabled: true
   transport: "stdio"
-  command: ["mneme", "--db", "~/.mneme/data/mneme.db"]
+  command: ["mimir", "--db", "~/.mimir/data/mimir.db"]
   timeout_s: 10.0
   merge_strategy: "local_first"
   fallback_to_local: true
@@ -226,7 +226,7 @@ mneme:
     cooldown: 120
 ```
 
-Then add `@memory` to `.perseus/context.md` and Perseus will call `mneme_recall` at
+Then add `@memory` to `.perseus/context.md` and Perseus will call `mimir_recall` at
 render time to populate context with relevant memories.
 
 ---

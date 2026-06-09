@@ -1,10 +1,10 @@
-# Mneme Roadmap
+# Mimir Roadmap
 
-## What Mneme Is
+## What Mimir Is
 
 A local-first persistent memory engine for AI agents. MCP-native. Single static binary. Zero runtime dependencies. Memories stored as `.md` files in a vault — human-readable, git-trackable, Obsidian-compatible.
 
-## What Mneme Is Not
+## What Mimir Is Not
 
 - Not a knowledge graph or entity extraction engine
 - Not a cloud service or SaaS
@@ -19,7 +19,7 @@ A local-first persistent memory engine for AI agents. MCP-native. Single static 
 
 - SQLite + FTS5 keyword search with LIKE fallback
 - MCP JSON-RPC 2.0 stdio server
-- Three tools: `mneme_store`, `mneme_recall`, `mneme_health`
+- Three tools: `mimir_store`, `mimir_recall`, `mimir_health`
 - Single static binary, bundled SQLite, zero runtime deps
 - Bootstrap script for one-command install
 - Works fully offline after build
@@ -33,13 +33,13 @@ A local-first persistent memory engine for AI agents. MCP-native. Single static 
 ## v0.2 — The `.md` Vault
 **Target:** "Your memories are your files."
 
-This is the release that makes Mneme a real standalone tool with a clear differentiator.
+This is the release that makes Mimir a real standalone tool with a clear differentiator.
 
 ### `.md` vault storage
-Memories stored as individual `.md` files with YAML frontmatter in `~/.mneme/vault/`. The SQLite database becomes a search index over the vault, not the source of truth.
+Memories stored as individual `.md` files with YAML frontmatter in `~/.mimir/vault/`. The SQLite database becomes a search index over the vault, not the source of truth.
 
 ```
-~/.mneme/vault/
+~/.mimir/vault/
 ├── mem-2026-06-09-a1b2c3.md
 ├── mem-2026-06-09-d4e5f6.md
 └── mem-2026-06-10-g7h8i9.md
@@ -69,17 +69,17 @@ Port 5432, max 100 connections. Auth via scram-sha-256.
 | Agent-editable | Agents can read/write `.md` as easily as calling an API |
 | Diffable | See what your agent learned between sessions |
 
-### MCP tool: `mneme_vault_export`
+### MCP tool: `mimir_vault_export`
 Export all memories to `.md` files (idempotent — updates changed files, creates new ones, never deletes).
 
-### MCP tool: `mneme_vault_import`
+### MCP tool: `mimir_vault_import`
 Scan the vault directory and index new/changed `.md` files into SQLite FTS5.
 
 ### FTS5 index rebuild
 Rebuild the search index from the vault on demand. Makes the vault the canonical store and SQLite a performance cache.
 
 ### Existing tools work unchanged
-`mneme_store` still writes to SQLite. `mneme_vault_export` syncs to `.md`. If someone only ever calls `mneme_store`/`mneme_recall`, nothing changes.
+`mimir_store` still writes to SQLite. `mimir_vault_export` syncs to `.md`. If someone only ever calls `mimir_store`/`mimir_recall`, nothing changes.
 
 ---
 
@@ -89,7 +89,7 @@ Rebuild the search index from the vault on demand. Makes the vault the canonical
 Memories currently accumulate forever with no decay, dedup, or summarization. This release adds basic memory hygiene.
 
 ### Ebbinghaus decay
-Memories lose relevance over time based on a forgetting curve. `decay_score` drops when a memory isn't retrieved. `mneme_recall` filters out memories below a threshold by default. Retrieval resets the decay clock.
+Memories lose relevance over time based on a forgetting curve. `decay_score` drops when a memory isn't retrieved. `mimir_recall` filters out memories below a threshold by default. Retrieval resets the decay clock.
 
 Implementation: a `decay_score` column already exists (always `1.0` in v0.1). A background pass updates scores on recall, and a configurable threshold drops stale memories from results.
 
@@ -100,14 +100,14 @@ When storing a new memory, check existing memories for high similarity (Levensht
 Memories can be tagged with a TTL at store time: "this debugging session fact expires in 24 hours." The decay algorithm respects TTL alongside the forgetting curve.
 
 ### Memory compaction
-A manual `mneme_compact` tool that:
+A manual `mimir_compact` tool that:
 - Merges near-duplicate memories into single entries
 - Summarizes clusters of related low-importance memories
 - Drops memories below a configurable decay threshold
 - Rebuilds the vault from the compacted state
 
 ### Memory stats
-`mneme_health` extended to report:
+`mimir_health` extended to report:
 - Total memories, by type, by age bucket
 - Decay distribution
 - Storage size (SQLite + vault)
@@ -127,13 +127,13 @@ FTS5 keyword search requires exact word matches. This release adds a vector path
 - Hybrid search: FTS5 keyword + cosine similarity, merged and ranked
 
 ### Why bundled, not external?
-Mneme's pitch is "works offline." Requiring Ollama or an API key for embeddings breaks that. A small ONNX model (~80MB) bundled at build time keeps the offline guarantee. Quality is lower than a cloud embedding, but for memory retrieval ("find my notes about database config"), it's more than sufficient.
+Mimir's pitch is "works offline." Requiring Ollama or an API key for embeddings breaks that. A small ONNX model (~80MB) bundled at build time keeps the offline guarantee. Quality is lower than a cloud embedding, but for memory retrieval ("find my notes about database config"), it's more than sufficient.
 
-### MCP tool: `mneme_search`
-Replaces `mneme_recall` with a unified search that combines keyword + semantic. Accepts a `mode` parameter: `keyword`, `semantic`, or `hybrid` (default).
+### MCP tool: `mimir_search`
+Replaces `mimir_recall` with a unified search that combines keyword + semantic. Accepts a `mode` parameter: `keyword`, `semantic`, or `hybrid` (default).
 
 ### Backward compatibility
-`mneme_recall` continues to work — it becomes an alias for `mneme_search` with `mode=keyword`. No breaking change.
+`mimir_recall` continues to work — it becomes an alias for `mimir_search` with `mode=keyword`. No breaking change.
 
 ---
 
@@ -147,10 +147,10 @@ Memories tagged with `workspace` at store time. Recall can filter by workspace o
 Memories tagged with the agent that stored them. Recall can filter by agent. An agent can ask "what did I learn last time?" or "what did any agent learn about this repo?"
 
 ### Cross-workspace federation
-Two Mneme instances on different machines can share memories. Not real-time sync — export/import via the vault directory. Rsync your `~/.mneme/vault/` between machines, rebuild the index, and your laptop agent recalls what your desktop agent learned.
+Two Mimir instances on different machines can share memories. Not real-time sync — export/import via the vault directory. Rsync your `~/.mimir/vault/` between machines, rebuild the index, and your laptop agent recalls what your desktop agent learned.
 
-### MCP tool: `mneme_federate`
-Push/pull memories between instances via the vault. `mneme_federate pull` scans a remote vault path and imports new memories. `mneme_federate push` exports local memories to a target vault.
+### MCP tool: `mimir_federate`
+Push/pull memories between instances via the vault. `mimir_federate pull` scans a remote vault path and imports new memories. `mimir_federate push` exports local memories to a target vault.
 
 ---
 
@@ -161,23 +161,23 @@ Push/pull memories between instances via the vault. `mneme_federate pull` scans 
 Group memories by topic using the embedding model. Surface clusters of related memories that aren't explicitly linked.
 
 ### Memory chains
-When an agent stores linked memories (via the `links` field that already exists in the schema), `mneme_recall` can traverse the chain. "Show me everything related to this architecture decision" follows the link graph.
+When an agent stores linked memories (via the `links` field that already exists in the schema), `mimir_recall` can traverse the chain. "Show me everything related to this architecture decision" follows the link graph.
 
 ### Auto-summarization
-`mneme_summarize` tool: given a topic path or query, returns a synthesized summary of all matching memories. Uses a local LLM if available (via Ollama endpoint), falls back to concatenation if not.
+`mimir_summarize` tool: given a topic path or query, returns a synthesized summary of all matching memories. Uses a local LLM if available (via Ollama endpoint), falls back to concatenation if not.
 
 ### Memory timeline
-`mneme_timeline` tool: returns memories in chronological order, optionally filtered by topic. "What did we learn about the database between March and May?"
+`mimir_timeline` tool: returns memories in chronological order, optionally filtered by topic. "What did we learn about the database between March and May?"
 
 ---
 
 ## Beyond v0.6 — Ideas, Not Commitments
 
 ### SSE/HTTP transport
-Serve Mneme over HTTP + SSE for non-stdio MCP hosts. Useful for browser-based agents and remote setups.
+Serve Mimir over HTTP + SSE for non-stdio MCP hosts. Useful for browser-based agents and remote setups.
 
 ### Obsidian plugin
-A community plugin that treats Mneme's vault as an Obsidian vault. Browse, search, and edit agent memories in Obsidian. Close the loop: you write notes in Obsidian, your agent learns from them via Mneme, the agent's learnings appear back in Obsidian.
+A community plugin that treats Mimir's vault as an Obsidian vault. Browse, search, and edit agent memories in Obsidian. Close the loop: you write notes in Obsidian, your agent learns from them via Mimir, the agent's learnings appear back in Obsidian.
 
 ### Memory quality scoring
 Agents can rate memories: "this fact was useful" or "this was wrong." Quality scores feed into recall ranking and decay.
@@ -198,21 +198,21 @@ These are non-negotiable and apply to every release:
 
 2. **Offline-first.** All core operations work without internet. Optional cloud features (federation, remote embeddings) are opt-in, not required.
 
-3. **Human-readable storage.** The vault is the source of truth. If Mneme disappears tomorrow, your memories are still `.md` files you can read with any text editor.
+3. **Human-readable storage.** The vault is the source of truth. If Mimir disappears tomorrow, your memories are still `.md` files you can read with any text editor.
 
-4. **MCP-native.** Every feature ships as an MCP tool. No SDK to install, no library to import. Any MCP host can use Mneme immediately.
+4. **MCP-native.** Every feature ships as an MCP tool. No SDK to install, no library to import. Any MCP host can use Mimir immediately.
 
 5. **Agent-first, not human-first.** Tools are designed for AI agents to call programmatically. The human UX is the `.md` vault — open it in any editor.
 
-6. **Compose, don't integrate.** Mneme does one thing (persistent memory). It composes with other tools (Perseus for context, Obsidian for browsing, Git for versioning) rather than trying to absorb their functionality.
+6. **Compose, don't integrate.** Mimir does one thing (persistent memory). It composes with other tools (Perseus for context, Obsidian for browsing, Git for versioning) rather than trying to absorb their functionality.
 
 ---
 
 ## Competitive Positioning
 
-Mneme sits in the **lightweight / zero-dependency** tier of AI memory tools, alongside Mnemosyne and Holographic. Its differentiators:
+Mimir sits in the **lightweight / zero-dependency** tier of AI memory tools, alongside Mnemosyne and Holographic. Its differentiators:
 
-| Dimension | Mneme | Mem0 | Hindsight |
+| Dimension | Mimir | Mem0 | Hindsight |
 |-----------|-------|------|-----------|
 | Runtime deps | Static binary | Python/cloud | PostgreSQL |
 | Storage format | `.md` vault | Managed DB | PostgreSQL |
@@ -223,7 +223,7 @@ Mneme sits in the **lightweight / zero-dependency** tier of AI memory tools, alo
 | Cost | $0 forever | Freemium | Free (local) |
 | Human-readable | ✅ `.md` files | ❌ opaque | ❌ SQL |
 
-**When to choose Mneme:**
+**When to choose Mimir:**
 - You want agent memory that lives in files you can read
 - You need fully offline operation
 - You're already using MCP-compatible tools

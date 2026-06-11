@@ -291,30 +291,25 @@
 <section>
   <div class="container">
     <h2>Benchmark</h2>
-    <p style="color:var(--muted); margin-bottom:24px">Mimir v0.5-rc capability benchmark against Sibyl's claimed feature set.</p>
+    <p style="color:var(--muted); margin-bottom:24px">v0.5-rc on Linux 6.18, Intel i5-13500, NVMe. 10,000 entities, 1,000 journal events.</p>
     <div class="bench-results">
       <table>
-        <tr><th>Capability</th><th>Mimir</th><th>Sibyl</th><th>Winner</th></tr>
-        <tr><td>Category/Key Entity Model</td><td class="pass">✅</td><td>✅</td><td>=</td></tr>
-        <tr><td>Idempotent Entity Storage</td><td class="pass">✅</td><td>✅</td><td>=</td></tr>
-        <tr><td>Category-Filtered Search</td><td class="pass">✅</td><td>✅</td><td>=</td></tr>
-        <tr><td>Journal Events</td><td class="pass">✅</td><td>✅</td><td>=</td></tr>
-        <tr><td>State with TTL</td><td class="pass">✅</td><td>✅</td><td>=</td></tr>
-        <tr><td>Entity Linking</td><td class="pass">✅</td><td>❌</td><td>Mimir</td></tr>
-        <tr><td>Ebbinghaus Decay</td><td class="pass">✅</td><td>❌</td><td>Mimir</td></tr>
-        <tr><td>Layer Progression</td><td class="pass">✅</td><td>❌</td><td>Mimir</td></tr>
-        <tr><td>Near-Duplicate Detection</td><td class="pass">✅</td><td>❌</td><td>Mimir</td></tr>
-        <tr><td>.md Vault Export</td><td class="pass">✅</td><td>❌</td><td>Mimir</td></tr>
-        <tr><td>Conflict Detection</td><td class="pass">✅</td><td>❌</td><td>Mimir</td></tr>
-        <tr><td>Quality Scoring</td><td class="pass">✅</td><td>❌</td><td>Mimir</td></tr>
-        <tr><td>Chain Traversal</td><td class="pass">✅</td><td>❌</td><td>Mimir</td></tr>
-        <tr><td>Zero Python SDK Dep</td><td class="pass">✅ Rust binary</td><td>❌ pip install</td><td>Mimir</td></tr>
-        <tr><td>MCP-Native</td><td class="pass">✅ Built-in</td><td>⚠ Wrapper needed</td><td>Mimir</td></tr>
+        <tr><th>Test</th><th class="metric">Result</th><th>Scale</th></tr>
+        <tr><td>Write throughput</td><td class="metric pass">155 docs/sec</td><td>10,000 entities</td></tr>
+        <tr><td>Recall latency (p50)</td><td class="metric pass">15.3ms</td><td>100 queries over 10K corpus</td></tr>
+        <tr><td>Recall latency (p99)</td><td class="metric pass">23.9ms</td><td>100 queries over 10K corpus</td></tr>
+        <tr><td>Journal throughput</td><td class="metric pass">141 events/sec</td><td>1,000 events</td></tr>
+        <tr><td>Vault export</td><td class="metric pass">4,112 files/sec</td><td>.md with YAML frontmatter</td></tr>
+        <tr><td>Near-duplicate detection</td><td class="pass">✅ Verified</td><td>Trigram overlap at 70% threshold</td></tr>
+        <tr><td>Ebbinghaus decay</td><td class="pass">✅ Verified</td><td>Fresh entities rank above stale</td></tr>
+        <tr><td>Layer progression</td><td class="pass">✅ Verified</td><td>buffer → working → core at 20 retrievals</td></tr>
+        <tr><td>DB size (10K entities)</td><td class="metric pass">184 KB</td><td>SQLite with FTS5 index</td></tr>
+        <tr><td>Binary size</td><td class="metric pass">3.7 MB</td><td>Static Rust binary, zero runtime deps</td></tr>
       </table>
     </div>
     <p style="color:var(--muted); font-size:13px; margin-top:16px">
-      LongMemEval pending — requires embedding model (v0.3). Sibyl claims 95.6% (#2). 
-      Target: match or exceed with hybrid FTS5 + cosine similarity search.
+      Full benchmark source: <a href="https://github.com/tcconnally/mimir/blob/main/benchmark/run.py">benchmark/run.py</a>. 
+      LongMemEval pending — hybrid FTS5 + embedding search planned for v0.3.
     </p>
   </div>
 </section>

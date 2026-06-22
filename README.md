@@ -1,114 +1,252 @@
 # Mimir
 
-<!-- mcp-name: io.github.tcconnally/mimir -->
+<!-- mcp-name: io.github.Perseus-Computing-LLC/mimir -->
 
-> Persistent memory for AI agents. Structured entity model. SQLite + FTS5 + hybrid vector search. MCP-native. Fully local.
+> **Persistent Memory for AI Agents — MCP-Native. Local-First. Zero Dependencies.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://rust-lang.org)
 [![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/Perseus-Computing-LLC/mimir/releases)
+[![LangGraph](https://img.shields.io/badge/integrations-LangGraph-blue)](integrations/langgraph/)
+[![CrewAI](https://img.shields.io/badge/integrations-CrewAI-orange)](integrations/crewai/)
+[![AutoGen](https://img.shields.io/badge/integrations-AutoGen-purple)](integrations/autogen/)
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-36-brightgreen)]()
 
-## What is Mimir?
+Mimir is a single Rust binary that gives AI agents durable memory across sessions.
+**One binary. One file. No Docker. No Postgres. No cloud.** Just persistent memory
+that works with any MCP host.
 
-Mimir is a lightweight **MCP JSON-RPC 2.0 stdio server** that gives AI agents durable
-memory across sessions. Agents store structured entities, journal their decisions,
-manage transient state, generate embeddings, query with hybrid search, and ingest
-external data — all through **31 MCP tools**.
-
-It uses **SQLite with FTS5 + dense vector search** across three tables: entities
-(structured, idempotent), journal (append-only event log), and state (key-value
-with TTL). Optional Ollama integration enables RAG (`mimir_ask`) and embedding
-generation (`mimir_embed`). A built-in web dashboard provides visual exploration.
-
-Works with any MCP host: Claude Desktop, Cursor, OpenClaw, Hermes Agent, Perseus, etc.
-
----
-
-## Quick Start
+## One-Line Install
 
 ```bash
-# Build from source
-git clone https://github.com/Perseus-Computing-LLC/mimir.git
-cd mimir
-cargo build --release
-
-# Linux/macOS: use cargo install to avoid macOS security kill (Killed: 9)
-cargo install --path .
-
-# Or copy manually (Linux only — macOS will kill the unsigned binary)
-cp target/release/mimir ~/.local/bin/
-
-# Or download the binary
-curl -sSL https://github.com/Perseus-Computing-LLC/mimir/releases/download/v1.0.0/mimir-v1.0.0-linux-x86_64 -o mimir
-chmod +x mimir && mv mimir ~/.local/bin/
+curl -sSf https://raw.githubusercontent.com/Perseus-Computing-LLC/mimir/main/scripts/install.sh | sh
 ```
 
-**Requirements:** Rust 1.70+ (stable), a C compiler (rusqlite bundles SQLite).
-
----
-
-## Install
-
-Mimir is a standalone Rust binary — no Python client needed. Download the latest release:
+That's it. Mimir is installed to `~/.local/bin/mimir`. Start it:
 
 ```bash
-# Linux x86_64
-curl -fsSL https://github.com/Perseus-Computing-LLC/mimir/releases/latest/download/mimir-x86_64-unknown-linux-gnu -o mimir
-chmod +x mimir
-sudo mv mimir /usr/local/bin/
-
-# macOS (Apple Silicon)
-curl -fsSL https://github.com/Perseus-Computing-LLC/mimir/releases/latest/download/mimir-aarch64-apple-darwin -o mimir
-chmod +x mimir
-sudo mv mimir /usr/local/bin/
-
-# Or build from source
-cargo build --release
-./target/release/mimir --db ./memory.db
+mimir serve --db ~/.mimir/data/mimir.db
 ```
 
-## Quickstart
+Connect any MCP host (Claude Desktop, Cursor, Hermes Agent, Perseus, etc.):
+
+```json
+{
+  "mcpServers": {
+    "mimir": {
+      "command": "mimir",
+      "args": ["serve", "--db", "~/.mimir/data/mimir.db"]
+    }
+  }
+}
+```
+
+## 30-Second Quickstart
 
 ```bash
-# Start the server
-./mimir serve --db memory.db
+# Start Mimir
+mimir serve --db memory.db &
+sleep 1
 
-# Remember a fact via the HTTP API
-curl -s -X POST http://localhost:8787/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_remember","arguments":{"category":"demo","key":"hello","body_json":"{\"text\":\"Hello world — my first persistent memory!\"}"}}}'
+# Remember a fact (via MCP JSON-RPC on stdio)
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_remember","arguments":{"category":"demo","key":"hello","body_json":"{\"text\":\"Hello from Mimir!\"}"}}}' | mimir serve --db memory.db
 
-# Recall it
-curl -s -X POST http://localhost:8787/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mimir_recall","arguments":{"query":"first memory"}}}'
+# Search for it
+echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mimir_recall","arguments":{"query":"Hello"}}}' | mimir serve --db memory.db
 ```
 
-## Why Mimir vs Alternatives
+## Why Mimir
+
+Mimir is the **only** memory engine that is simultaneously MCP-native,
+local-first, zero-dependency, AND agent-first.
+
+### Comparison Matrix
 
 | | Mimir | Mem0 | Letta | Zep |
 |---|---|---|---|---|
-| **Deployment** | Single binary | Cloud + self-host | Docker/Postgres | Docker/Postgres |
+| **Deployment** | Single binary (~8MB) | Cloud + self-host | Docker/Postgres | Docker/Postgres |
 | **Dependencies** | None (SQLite embedded) | Python + vector DB | Postgres + Python | Postgres + Go |
+| **MCP-Native** | ✅ 36 tools | ❌ Not MCP-native | ❌ Not MCP-native | ❌ Not MCP-native |
+| **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
 | **Encryption** | AES-256-GCM ✅ | ❌ | ❌ | ❌ |
 | **Hybrid Search** | BM25 + Dense + RRF | Vector only | Vector only | Vector + Graph |
-| **MCP Tools** | 23 | 5 | 8 | 0 |
-| **Offline/Local** | ✅ Fully local | Cloud-dependent | Docker needed | Docker needed |
+| **Entity Lifecycle** | Decay + Promote + Archive | ❌ | ❌ | ❌ |
+| **Entity Graph** | Link + Traverse | ❌ | ❌ | ✅ |
+| **Journal Audit Trail** | ✅ Immutable | ❌ | ❌ | ❌ |
+| **State Management** | ✅ Key-value + TTL | ❌ | ❌ | ❌ |
+| **MCP Tools** | 36 | 5 | 8 | 0 |
+| **GitHub Stars** | ~20 | ~55K | ~15K | ~3K |
 | **License** | MIT | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
-Mimir is for teams that want **production memory without infrastructure** — no Postgres, no Docker, no cloud services. Just one binary.
+[Full comparison: Mimir vs Mem0 →](docs/comparison/mimir-vs-mem0.md)
+[vs Letta →](docs/comparison/mimir-vs-letta.md)
+[vs Zep →](docs/comparison/mimir-vs-zep.md)
+
+### Stress Test: 100K Entities
+
+Mimir handles production workloads on modest hardware:
+
+| Metric | Result |
+|---|---|
+| **100K entity insert** | 1.01s (98,732 entities/s) |
+| **FTS5 recall (10 results)** | 0.022s |
+| **Decay tick (100K entities)** | 1.317s (batched, transactional) |
+| **Memory (100K entities)** | ~85MB RSS |
+| **DB file size (100K)** | ~45MB (with FTS5 index) |
+
+Run it yourself: `cargo test stress_100k --release -- --ignored --nocapture`
+
+## Framework Integrations
+
+Ready-to-use adapters that make Mimir the default memory backend for
+popular AI agent frameworks:
+
+| Framework | Integration | Type |
+|---|---|---|
+| [**LangGraph**](integrations/langgraph/) | `MimirStore` | `BaseStore` implementation |
+| [**CrewAI**](integrations/crewai/) | `MimirMemoryTool` | Agent tool |
+| [**AutoGen**](integrations/autogen/) | `MimirMemory` | `Memory` implementation |
+
+Each adapter:
+- Connects via MCP stdio subprocess (persistent session)
+- Maps the framework's memory interface to Mimir tools
+- Comes with a README quickstart (5 minutes to working)
+- Has passing tests with mocked MCP transport
+
+Any MCP-compatible framework works with Mimir directly. See
+[Awesome Mimir](awesome-mimir.md) for the full list.
+
+## 36 MCP Tools
+
+### Entity CRUD
+| Tool | Description |
+|---|---|
+| `mimir_remember` | Store/update entity. Idempotent by (category, key). |
+| `mimir_recall` | Search with FTS5/dense/hybrid modes, filters, stemming expansion. |
+| `mimir_recall_when` | Proactive just-in-time recall: surface entities whose `recall_when` triggers match. |
+| `mimir_get_entity` | Fetch one entity by ID with full `body_json`. |
+| `mimir_forget` | Soft-delete (archived=1). |
+
+### Search & RAG
+| Tool | Description |
+|---|---|
+| `mimir_ask` | RAG: recall context, query LLM, return grounded answer with sources. |
+| `mimir_embed` | Generate dense vectors via Ollama or OpenAI-compatible endpoint. |
+| `mimir_context` | Pre-formatted markdown block for session injection. |
+| `mimir_ingest` | Trigger connector syncs (GitHub, file watcher). |
+
+### Graph
+| Tool | Description |
+|---|---|
+| `mimir_link` | Create typed relationship links between entities. |
+| `mimir_unlink` | Remove entity links. |
+| `mimir_traverse` | Walk entity link graph up to configurable depth. |
+
+### Journal
+| Tool | Description |
+|---|---|
+| `mimir_journal` | Append structured event with actor attribution. |
+| `mimir_timeline` | Query journal by time range with filters. |
+
+### State
+| Tool | Description |
+|---|---|
+| `mimir_state_set` | Set key-value state with optional TTL. |
+| `mimir_state_get` | Get state value. Returns null if expired. |
+| `mimir_state_delete` | Delete state entry. |
+| `mimir_state_list` | List state keys, optionally filtered by prefix. |
+
+### Lifecycle
+| Tool | Description |
+|---|---|
+| `mimir_decay` | Recalculate Ebbinghaus decay scores (batched 1000-entity transactions). |
+| `mimir_prune` | Bulk archive by category, decay threshold, or age. |
+| `mimir_purge` | Permanently delete archived entities + VACUUM. Destructive. |
+| `mimir_cohere` | Autonomous coherence grooming pass — promote, decay, link, archive. |
+| `mimir_compact` | Archive entities below decay threshold. |
+| `mimir_reindex` | Rebuild FTS5 search index from entities table. |
+
+### Quality
+| Tool | Description |
+|---|---|
+| `mimir_score` | Assign quality score (0.0-1.0). |
+| `mimir_conflicts` | Detect near-duplicate entities via trigram similarity. |
+| `mimir_correct` | Structured correction capture for learning from errors. |
+
+### Vault & Federation
+| Tool | Description |
+|---|---|
+| `mimir_vault_export` | Export entities to .md files with YAML frontmatter. |
+| `mimir_vault_import` | Import from .md vault directory (idempotent). |
+| `mimir_federate` | Copy entities between workspaces. |
+| `mimir_workspace_list` | List all distinct entity categories. |
+
+### Metrics & Ops
+| Tool | Description |
+|---|---|
+| `mimir_stats` | Full DB statistics across all tables. |
+| `mimir_health` | Server and DB health check. |
+| `mimir_bench` | Performance benchmark tracking. |
+| `mimir_synthesize` | LLM session synthesis — extract lessons from transcripts. |
+| `mimir_migrate` | Migrate v0.1.x DB to current schema. |
+
+## CLI
+
+```bash
+# Server
+mimir serve --db /data/mimir.db
+mimir serve --web --port 8767 --encryption-key ~/.mimir/secret.key
+mimir serve --llm-endpoint http://localhost:11434/api/generate --llm-model llama3
+mimir serve --transport sse --port 8787 --mcp-token my-secret-token
+
+# Maintenance (operate directly on DB, no server needed)
+mimir stats          --db /data/mimir.db
+mimir forget         --db /data/mimir.db --category decision --key stale-choice --reason "superseded"
+mimir prune          --db /data/mimir.db --category junk --min-decay 0.1 --dry-run
+mimir purge          --db /data/mimir.db --dry-run
+mimir decay          --db /data/mimir.db
+mimir reindex        --db /data/mimir.db
+mimir vault-export   --db /data/mimir.db --vault-dir ./export/
+mimir vault-import   --db /data/mimir.db --vault-dir ./export/
+
+# Key management
+mimir keygen --key-file ~/.mimir/secret.key
+```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--db` | SQLite database path (default: `~/.mimir/data/mimir.db`) |
+| `--web` | Start web dashboard |
+| `--port` | Dashboard port (default: 8767) |
+| `--web-bind` | Dashboard bind address (default: 127.0.0.1) |
+| `--transport` | MCP transport: `stdio` (default), `sse`, or `http` |
+| `--mcp-token` | Bearer token for SSE/HTTP transport auth |
+| `--encryption-key` | AES-256-GCM key file path |
+| `--llm-endpoint` | LLM API endpoint for `mimir_ask` and embeddings |
+| `--llm-model` | LLM model name (default: llama3) |
+| `--llm-api-key` | API key for LLM endpoints (OpenAI, Azure, etc.) |
+| `--embedding-endpoint` | OpenAI-compatible embedding endpoint |
+| `--connectors-config` | Path to connectors.yaml |
 
 ## Features
 
 ### Hybrid Search
-- **FTS5 keyword search** with LIKE fallback and stemming expansion
+- **FTS5 keyword search** with LIKE fallback and Porter stemming expansion
 - **Dense vector search** via cosine similarity on stored embeddings
 - **Reciprocal Rank Fusion (RRF)** — combine keyword + vector results
-- **Query expansion** — Porter stemming variants for broader recall
+- **Query expansion** — automatic stemming variants for broader recall
+
+### Memory Lifecycle
+- **Ebbinghaus decay** — memories naturally fade unless retrieved (refresh on access)
+- **Layer promotion** — buffer → working → core based on access frequency
+- **Automatic archival** — stale entities archive; purge to permanently delete + VACUUM
+- **Always-on entities** — pin critical memories for unconditional session injection
 
 ### RAG & Embeddings
-- **`mimir_ask`** — natural language Q&A over stored memories via Ollama
-- **`mimir_embed`** — generate and store dense vectors via Ollama `/api/embed`
+- **`mimir_ask`** — natural language Q&A over stored memories via any LLM (Ollama, OpenAI, etc.)
+- **`mimir_embed`** — generate and store dense vectors via Ollama or OpenAI-compatible `/v1/embeddings`
 - Supports single-entity and batch-category embedding
 
 ### Encryption
@@ -126,177 +264,29 @@ Mimir is for teams that want **production memory without infrastructure** — no
 ### External Connectors
 - **GitHub issues connector** — ingest issues/PRs by repo, rate-limit aware
 - **File watcher** — scan directories for `.md`/`.txt`/`.json` files with content-hash dedup
-- **`mimir_ingest`** — trigger connector syncs, dry-run preview
 - YAML-based connector config via `--connectors-config`
 
-### Data Lifecycle
-- **`mimir_prune`** — bulk archive by category, decay threshold, or age
-- **Ebbinghaus decay** with retrieval boosts and configurable archiving
-- **Near-duplicate detection** via trigram similarity
-- **Vault export/import** — markdown files with YAML frontmatter
+### Multi-Transport
+- **stdio** (default) — zero-config, works with any MCP host
+- **SSE** — Server-Sent Events for HTTP-based MCP clients
+- **HTTP** — REST-style MCP endpoint
+- **Bearer token auth** — for SSE/HTTP transports
 
----
+## Perseus Integration
 
-## MCP Tools (31 tools)
-
-### Entity tools
-| Tool | Description |
-|---|---|
-| `mimir_remember` | Store/update entity. Idempotent by (category, key). |
-| `mimir_recall` | Search with FTS5/dense/hybrid modes, filters, stemming expansion. |
-| `mimir_recall_when` | Proactive just-in-time recall: surface entities whose `recall_when` triggers match a given context. |
-| `mimir_get_entity` | Fetch one entity by ID with full `body_json` (e.g. to read a result truncated by `preview_cap`). |
-| `mimir_forget` | Soft-delete (archived=1). |
-| `mimir_link` | Create relationship links between entities. |
-| `mimir_unlink` | Remove entity links. |
-
-### Search & RAG
-| Tool | Description |
-|---|---|
-| `mimir_ask` | RAG: recall context, query Ollama, return grounded answer with sources. |
-| `mimir_embed` | Generate dense vectors via Ollama `/api/embed`. Single or batch. |
-| `mimir_ingest` | Trigger connector syncs (GitHub, file watcher). |
-
-### Journal tools
-| Tool | Description |
-|---|---|
-| `mimir_journal` | Append journal event with evaluated/acted/forward structure. |
-| `mimir_timeline` | Query journal by time range with optional filters. |
-
-### State tools
-| Tool | Description |
-|---|---|
-| `mimir_state_set` | Set key-value state with optional TTL. |
-| `mimir_state_get` | Get state value. Returns null if expired/missing. |
-| `mimir_state_delete` | Delete state entry. |
-| `mimir_state_list` | List state keys, optionally filtered by prefix. |
-
-### Management
-| Tool | Description |
-|---|---|
-| `mimir_health` | Server and DB health check. |
-| `mimir_stats` | Full DB statistics across all tables. |
-| `mimir_compact` | Archive entities below decay threshold (supports dry-run). |
-| `mimir_migrate` | Migrate v0.1.x DB to v0.2.0 schema. |
-| `mimir_context` | Pre-formatted markdown context for session injection. |
-| `mimir_workspace_list` | List all distinct entity categories. |
-| `mimir_prune` | Bulk archive by category, decay, or age. |
-| `mimir_cohere` | Autonomous coherence pass: promote buffer→working, apply decay, auto-link related entities, archive stale. |
-
-### Graph & analysis
-| Tool | Description |
-|---|---|
-| `mimir_traverse` | Walk entity link graph up to configurable depth. |
-| `mimir_score` | Assign quality score (0.0-1.0). |
-| `mimir_conflicts` | Detect near-duplicate entities via trigram similarity. |
-| `mimir_decay` | Recalculate Ebbinghaus decay scores. |
-| `mimir_reindex` | Rebuild the FTS5 search index from the entities table (repairs index drift). |
-
-### Vault
-| Tool | Description |
-|---|---|
-| `mimir_vault_export` | Export entities to .md files with YAML frontmatter. |
-| `mimir_vault_import` | Import from .md vault directory (idempotent). |
-
----
-
-## CLI
-
-```
-mimir serve --db /data/mimir.db
-mimir serve --web --port 8767 --encryption-key ~/.mimir/secret.key
-mimir serve --llm-endpoint http://localhost:11434/api/generate --llm-model llama3
-mimir serve --connectors-config ~/.mimir/connectors.yaml
-mimir keygen --key-file ~/.mimir/secret.key
-mimir migrate --from old.db --to new.db
-
-# Maintenance commands (operate directly on the DB, no server needed)
-mimir stats   --db /data/mimir.db
-mimir forget  --db /data/mimir.db --category decision --key stale-choice --reason "superseded"
-mimir prune   --db /data/mimir.db --category junk --min-decay 0.1 --older-than-days 90 --dry-run
-mimir decay   --db /data/mimir.db
-mimir reindex --db /data/mimir.db   # rebuild FTS5 index, repairs index drift
-```
-
-### Flags
-| Flag | Description |
-|---|---|
-| `--db` | SQLite database path (default: `~/.mimir/data/mimir.db`) |
-| `--web` | Start web dashboard |
-| `--port` | Dashboard port (default: 8767) |
-| `--web-bind` | Dashboard bind address (default: 127.0.0.1) |
-| `--encryption-key` | AES-256-GCM key file path |
-| `--llm-endpoint` | Ollama API endpoint for `mimir_ask` and `mimir_embed` |
-| `--llm-model` | Ollama model name (default: llama3) |
-| `--connectors-config` | Path to connectors.yaml |
-
-
-## MCP Configuration
-
-```json
-{
-  "mcpServers": {
-    "mimir": {
-      "command": "mimir",
-      "args": ["--db", "/home/YOU/.mimir/data/mimir.db"]
-    }
-  }
-}
-```
-
-### Perseus
+Mimir is the default memory backend for [Perseus](https://perseus.observer):
 
 ```yaml
 mimir:
   enabled: true
   transport: "stdio"
-  command: ["mimir", "--db", "~/.mimir/data/mimir.db"]
+  command: ["mimir", "serve", "--db", "~/.mimir/data/mimir.db"]
   timeout_s: 30.0
   merge_strategy: "local_first"
   fallback_to_local: true
   context_categories: ["decision", "architecture", "convention"]
   context_limit: 10
 ```
-
----
-
-## Connector Config
-
-```yaml
-connectors:
-  github:
-    enabled: true
-    token: "${GITHUB_TOKEN}"
-    repos:
-      - Perseus-Computing-LLC/mimir
-      - Perseus-Computing-LLC/perseus
-    days_past: 90
-    max_items_per_repo: 500
-  file_watcher:
-    enabled: true
-    paths:
-      - ~/Documents/notes
-      - ~/projects
-    extensions:
-      - .md
-      - .txt
-    debounce_ms: 1500
-```
-
----
-
-## Key Properties
-
-- **31 MCP tools** — full CRUD, search, RAG, embeddings, connectors, lifecycle
-- **Hybrid search** — FTS5 + dense vectors + RRF fusion
-- **Encryption at rest** — AES-256-GCM, opt-in, transparent
-- **Web dashboard** — built-in, browser-based, dark theme
-- **Zero runtime deps** — static binary with bundled SQLite
-- **No LLM required** — core operations work offline; Ollama optional for RAG/embeddings
-- **Single-file database** — easy backup, copy, inspect
-- **Fully offline** — no telemetry, no API calls, no network by default
-
----
 
 ## Government & Federal Procurement
 
@@ -308,7 +298,7 @@ Mimir is built for government deployment from the ground up.
 | **SBOM** | [Published](./docs/SBOM.md) — NTIA minimum elements |
 | **Air-gapped** | Fully offline — no telemetry, no API calls, no network by default |
 | **Encryption at rest** | AES-256-GCM, transparent, opt-in |
-| **Audit trail** | Immutable journal with chain-of-custody (in development) |
+| **Audit trail** | Immutable journal with chain-of-custody |
 | **Supply chain** | SLSA attestation in progress |
 
 **For federal buyers:** See [docs/federal-buyers.md](./docs/federal-buyers.md) for
@@ -317,8 +307,6 @@ on-premises, classified environments).
 
 Perseus Computing LLC is a US-owned small business. SAM.gov registration in progress.
 NAICS: 541715, 541511, 541512.
-
----
 
 ## License
 

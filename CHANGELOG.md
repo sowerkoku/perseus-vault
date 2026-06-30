@@ -5,6 +5,15 @@ All notable changes to Mimir are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+- **`layer` filter on `mimir_recall` now actually filters (#269 follow-up).** The
+  `layer` recall parameter was accepted but never applied — `RecallParams.layer`
+  was a dead field. It now filters by biomimetic layer in all three modes:
+  keyword (`fts5_search`) and BM25 (`fts5_bm25_search`) pre-filter in-query, and a
+  mode-agnostic post-filter in `recall()` covers the dense arm of dense/hybrid
+  (which scores vectors without `RecallParams` access). Aliases world/episodic/
+  semantic are normalized to core/buffer/working at the tools layer.
+
 ### Added
 - **`mimir_history` tool (code-review follow-up).** The bi-temporal `history_versions`
   reader (v2.4.0) was complete and tested but no tool exposed it — you could time-travel

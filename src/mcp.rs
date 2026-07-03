@@ -48,20 +48,82 @@ impl MCPState {
     }
 }
 
+/// Parse the `MIMIR_IDLE_TIMEOUT_SECS` env value into an idle-watchdog duration.
+///
+/// - unset / unparseable  -> default 600s (Some)
+/// - "0"                  -> disabled (None)
+/// - "N"                  -> Some(N seconds)
+///
+/// Factored out of `run_server` so the orphan-leak guard (#57228) is unit-tested.
+pub fn parse_idle_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
+    match raw {
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+            Err(_) => Some(std::time::Duration::from_secs(600)),
+        },
+        None => Some(std::time::Duration::from_secs(600)),
+    }
+}
+
 /// Run the MCP server loop: read JSON-RPC from stdin, write responses to stdout.
 ///
 /// Takes `Arc<Database>` (#402) so main.rs can hand the SAME pooled Database
 /// to the web dashboard / gRPC surfaces instead of each opening a second
 /// `Database` (a second 16-conn pool) on the same file.
 pub fn run_server(db: std::sync::Arc<Database>) {
-    let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    let reader = BufReader::new(stdin.lock());
     let state = MCPState::new();
+
+    // Idle watchdog (fixes NousResearch/hermes-agent#57228 from the server side).
+    //
+    // A stdio MCP server that receives ZERO traffic for `idle_timeout` is, by
+    // definition, an abandoned/orphaned child: its client (a long-lived Hermes
+    // worker) reconnected and leaked the write-end of this pipe, so we will never
+    // see EOF and would otherwise block in the read forever — accumulating one
+    // orphan per reconnect until SQLite handle contention makes the vault appear
+    // "down". An ACTIVE client always issues a tools/call (or at least a ping)
+    // well within the window, so it is never affected; an orphan self-terminates
+    // and frees its DB handle. Override with MIMIR_IDLE_TIMEOUT_SECS (0 disables).
+    let idle_timeout: Option<std::time::Duration> =
+        parse_idle_timeout(std::env::var("MIMIR_IDLE_TIMEOUT_SECS").ok().as_deref());
+
+    // Read stdin on a dedicated thread so the main loop can time out on silence.
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let reader = BufReader::new(stdin.lock());
+        for line in reader.lines() {
+            // If the main loop has exited (idle timeout), the receiver is dropped
+            // and send() errors — stop reading and let this thread end.
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+        // EOF: closing tx makes the main loop's recv return Disconnected.
+    });
 
     eprintln!("mimir: MCP server ready");
 
-    for line in reader.lines() {
+    loop {
+        let line = match idle_timeout {
+            Some(timeout) => match rx.recv_timeout(timeout) {
+                Ok(l) => l,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!(
+                        "mimir: no client activity for {}s — exiting idle stdio server (orphan-leak guard, #57228)",
+                        timeout.as_secs()
+                    );
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(l) => l,
+                Err(_) => break,
+            },
+        };
+
         let line = match line {
             Ok(l) => l,
             Err(e) => {
@@ -4126,5 +4188,26 @@ mod tests {
         assert_eq!(keys(&all).len(), 2, "no filter should return both");
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn idle_timeout_parsing_covers_orphan_guard_cases() {
+        use std::time::Duration;
+        // Unset -> 10-minute default (guard ON).
+        assert_eq!(parse_idle_timeout(None), Some(Duration::from_secs(600)));
+        // Explicit "0" -> disabled (guard OFF, for interactive/debug use).
+        assert_eq!(parse_idle_timeout(Some("0")), None);
+        // Explicit value -> honored.
+        assert_eq!(parse_idle_timeout(Some("30")), Some(Duration::from_secs(30)));
+        // Whitespace tolerated.
+        assert_eq!(
+            parse_idle_timeout(Some(" 120 ")),
+            Some(Duration::from_secs(120))
+        );
+        // Garbage -> safe default, never panics.
+        assert_eq!(
+            parse_idle_timeout(Some("banana")),
+            Some(Duration::from_secs(600))
+        );
     }
 }

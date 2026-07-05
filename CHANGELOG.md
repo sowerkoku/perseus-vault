@@ -16,6 +16,14 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   scans `Cargo.lock` against RustSec on every push/PR and weekly, making the existing
   SECURITY.md claim true. (Vulnerabilities gate; two unmaintained-only advisories are
   documented ignores.)
+- **`traverse` clamps caller-supplied `max_depth`/`max_nodes`** to sane ceilings
+  (64 / 100,000) so a single request can't be asked to walk an unbounded slice of
+  the link graph (LOW DoS hardening).
+- **Dense recall clamps a negative `limit`** with `.max(0)` before the `usize` cast
+  (a negative would wrap huge; downstream caps already neutralized it — hygiene).
+- **GitHub connector validates `repo` as strict `owner/name`** before interpolating
+  it into the api.github.com URL, preventing path/query injection from a malformed
+  operator-config value (LOW).
 - See `docs/security-review-2026-07-05.md` for the full ranked review (the audit-chain
   integrity redesign — #1/#2 — is tracked as a separate follow-up).
 

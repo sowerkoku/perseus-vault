@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS journal (
     -- #417: workspace of the referenced entity, stamped at write time so purge
     -- can scope journal redaction per-workspace. '' = system event or legacy row.
     workspace_hash TEXT NOT NULL DEFAULT '',
+    -- v15 (2026-07-05): SHA-256 commitment over the payload, covered by the audit
+    -- chain so content tampering is detectable while the payload can still be
+    -- redacted (the commitment survives). See docs/audit-chain-keyed-mac-design.md.
+    payload_commitment TEXT DEFAULT '',
     created_at_unix_ms INTEGER NOT NULL
 );
 
@@ -173,7 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// the column-add migrations below have been applied. Bump this whenever you add
 /// a new ALTER-probe migration in `initialize_schema`, or existing databases
 /// (already at the previous level) will skip it.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -457,10 +461,11 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // Pre-v12 chains hashed only (prev_hash, id, created_at_unix_ms), so a
     // journal entry could be moved between workspaces without breaking the
     // chain. The hash now also folds in workspace_hash (stamped since v11).
-    // Recompute existing chains under the new formula so they still verify.
-    // Deterministic + idempotent; runs inside the migration transaction and is
-    // a no-op on a fresh DB (empty journal).
-    crate::db::rehash_audit_chain(conn)?;
+    // (The chain rehash that was here is now performed once in the v15 block —
+    // the v15 formula supersedes v12's, and the migrate function runs every block
+    // top-to-bottom for any DB below SCHEMA_VERSION, so a single final rehash is
+    // sufficient. Doing it here as well would fail on legacy journals that don't
+    // yet have the payload columns the v15 rehash reads.)
     // ── end v12 ──────────────────────────────────────────────────────────
 
     // ── v13: cover the browse ORDER BY tie-break in idx_entities_recall ──
@@ -487,12 +492,30 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     // SHA-256 over the same erasure-safe identifying tuple (prev, id,
     // created_at, workspace_hash). Recompute existing chains under the new
     // formula so they verify from here forward. Deterministic + idempotent;
-    // a no-op on a fresh DB (empty journal). (The chain still commits only to
-    // event existence/order/time/workspace — NOT payload content — so `purge`
-    // redaction stays compatible; keying the chain for true tamper-evidence is
-    // the tracked follow-up. See docs/security-review-2026-07-05.md.)
-    crate::db::rehash_audit_chain(conn)?;
+    // a no-op on a fresh DB (empty journal). (Rehash deferred to the v15 block —
+    // see the v12 note; the v15 formula supersedes this one.)
     // ── end v14 ──────────────────────────────────────────────────────────
+
+    // ── v15 (2026-07-05 security review): payload commitment + keyed chain ──
+    // Add the per-entry payload_commitment column and recompute the chain over
+    // (prev, id, created_at, workspace, commitment). At migration time no key is
+    // available, so the rehash is UNKEYED; `set_encryption` later rekeys it to
+    // HMAC once the encryption key is loaded. Backfills commitments for existing
+    // rows. Deterministic + idempotent; no-op on a fresh DB. See
+    // docs/audit-chain-keyed-mac-design.md.
+    // Ensure every column the rehash reads exists — a very old (pre-bitemporal)
+    // journal may predate some of them; ensure_column is idempotent.
+    ensure_column(conn, "journal", "event_type", "TEXT DEFAULT 'decision'")?;
+    ensure_column(conn, "journal", "evaluated_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "acted_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "forward_json", "TEXT DEFAULT '{}'")?;
+    ensure_column(conn, "journal", "category", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "key", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "entity_id", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "agent_id", "TEXT DEFAULT ''")?;
+    ensure_column(conn, "journal", "payload_commitment", "TEXT DEFAULT ''")?;
+    crate::db::rehash_audit_chain(conn)?;
+    // ── end v15 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

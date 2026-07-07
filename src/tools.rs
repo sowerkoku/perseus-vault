@@ -215,6 +215,12 @@ pub struct RecallArgs {
     pub recency_half_life_secs: Option<f64>,
     #[serde(default)]
     pub workspace_hash: Option<String>,
+    /// #485: scope as a ranking multiplier. 0.0–1.0; requires workspace_hash.
+    /// Widens the workspace filter to include global ('') memories, weighted
+    /// by this factor in the ranking — current-scope hits are preferred but
+    /// strong broader-scope hits still surface. Omit for the strict filter.
+    #[serde(default)]
+    pub scope_weight: Option<f64>,
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]
@@ -771,6 +777,23 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         }
     }
 
+    // #485: scope_weight is a rank multiplier in [0,1] and only means
+    // something relative to a workspace to prefer — reject junk up front
+    // rather than silently no-oping.
+    if let Some(w) = a.scope_weight {
+        if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+            return Err(format!(
+                "scope_weight must be between 0.0 and 1.0, got {w}"
+            ));
+        }
+        if a.workspace_hash.as_deref().map_or(true, |ws| ws.is_empty()) {
+            return Err(
+                "scope_weight requires a non-empty workspace_hash (the scope to prefer)"
+                    .to_string(),
+            );
+        }
+    }
+
     // #271: an unset `mode` ("" — the serde default) auto-selects the best
     // available strategy. When the embedding backend is on AND at least one
     // entity is embedded, default to Hybrid (deterministic dense + keyword RRF);
@@ -837,6 +860,7 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
         diversity_per_query_share: 0.0,
         recency_half_life_secs: a.recency_half_life_secs,
         workspace_hash: a.workspace_hash.clone(),
+        scope_weight: a.scope_weight,
         agent_id: a.agent_id.clone(),
         visibility: None,
         layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
@@ -1004,6 +1028,7 @@ fn handle_recall_with_expansion(db: &Database, a: &RecallArgs) -> Result<String,
             // re-weighting) never applies on this path.
             recency_half_life_secs: None,
             workspace_hash: a.workspace_hash.clone(),
+            scope_weight: a.scope_weight,
             agent_id: a.agent_id.clone(),
             visibility: None,
             layer: a.layer.as_deref().filter(|s| !s.is_empty()).map(canonical_layer),
@@ -3140,6 +3165,31 @@ mod tests {
         let path_str = path.to_str().unwrap().to_string();
         let db = Database::open(&path_str).expect("open test db");
         (db, path_str)
+    }
+
+    // ─── scope as a ranking multiplier (#485) ────────────────────
+
+    #[test]
+    fn recall_rejects_invalid_scope_weight() {
+        let (db, path) = temp_db();
+        let err = handle_recall(
+            &db,
+            json!({"query": "x", "workspace_hash": "ws-a", "scope_weight": 1.5}),
+        )
+        .expect_err("scope_weight > 1.0 must be rejected");
+        assert!(err.contains("scope_weight must be between"), "{err}");
+
+        let err = handle_recall(&db, json!({"query": "x", "scope_weight": 0.5}))
+            .expect_err("scope_weight without a workspace has no scope to prefer");
+        assert!(err.contains("requires a non-empty workspace_hash"), "{err}");
+
+        // Valid combination passes validation and runs.
+        handle_recall(
+            &db,
+            json!({"query": "x", "workspace_hash": "ws-a", "scope_weight": 0.5}),
+        )
+        .expect("valid scope_weight must be accepted");
+        let _ = std::fs::remove_file(&path);
     }
 
     // ─── derived_from auto-reinforcement (#487) ──────────────────

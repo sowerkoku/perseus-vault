@@ -6,6 +6,19 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- **Scope as a ranking multiplier in `recall`** (#485, Belief-Memory-inspired).
+  New optional `scope_weight` (0.0–1.0, requires `workspace_hash`): the workspace
+  predicate widens from a hard filter to "current workspace OR global (`''`)", with
+  broader-scope (global) hits weighted by the factor in the ranked paths — hybrid
+  fused scores and dense similarities are multiplied (same first-phase expression as
+  RRF/trust/decay/recency), and the score-less FTS5 keyword ordering gets a stable
+  two-tier sort (current scope first). Current-workspace memories outrank
+  equally-relevant global ones while a strong global memory still surfaces instead of
+  being silently invisible. The widening only ever adds GLOBAL rows — other
+  workspaces' memories stay excluded (#338/#339 scoping unchanged). Omitted =
+  strict-filter behavior, byte-identical to before. Read-only in ranking (#247
+  idempotence preserved). Invalid weights and weights without a workspace are
+  rejected up front.
 - **Auto-reinforcement via `derived_from` on `remember`** (#487, Belief-Memory-inspired).
   `remember` accepts an optional `derived_from` array (entity ids or `{category, key}`
   pairs, max 64) citing the memories the write was built on. Each cited source is

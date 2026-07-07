@@ -21,6 +21,14 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   rehashes). HMAC is unit-tested against RFC 4231. **Design + limits + reviewer questions:
   `docs/audit-chain-keyed-mac-design.md`.**
 
+## [2.18.1] - 2026-07-07
+
+### Fixed
+- **Temporal filter args now accept stringified integers** (#480). MCP/LLM tool-call clients frequently emit integer args as JSON strings (e.g. `"as_of_unix_ms": "1783400000000"`); the temporal `Option<i64>` fields on `recall` (`as_of_unix_ms`/`valid_at`/`valid_from_unix_ms`/`valid_to_unix_ms`) rejected them with "invalid type: string, expected i64" — making the v2.18.0 `as_of` filter uncallable from such clients (hit live on deploy). Added a number-or-string deserializer; also applied to `mimir_ask`'s temporal args. Numbers still work unchanged; non-numeric strings still error.
+
+### Added
+- **Temporal RAG completion** (#472 / #481). `recall`'s `valid_at` now *reconstructs* the historical world-version (via `bitemporal_at`) instead of narrowing live rows; with `as_of` it forms the full bi-temporal cell. `mimir_ask` gains `as_of_unix_ms` / `valid_at_unix_ms` (shared `Database::resolve_temporal_versions`) so RAG answers are reproducible at a past instant. `global_recall` stays current-view by design (its community summaries are recomputed artifacts, not versioned facts).
+
 ## [2.18.0] - 2026-07-07
 
 ### Added

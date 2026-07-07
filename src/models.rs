@@ -229,6 +229,19 @@ pub struct RecallParams {
     /// Workspace scope filter (v1.2.0). When Some, only entities with a
     /// matching workspace_hash are returned. None = no workspace filtering.
     pub workspace_hash: Option<String>,
+    /// #485: scope as a ranking multiplier, not just a filter. When Some(w)
+    /// (0.0–1.0) AND `workspace_hash` is Some(non-empty ws), the workspace
+    /// predicate widens from strict equality to "current workspace OR global
+    /// ('')", and broader-scope (global) hits are weighted by `w` in the
+    /// scored paths (hybrid RRF fusion, dense similarity) — current-scope
+    /// hits outrank equally-relevant global hits, but a strong global hit
+    /// can still surface instead of being silently invisible. The widening
+    /// only ever adds GLOBAL rows: other workspaces' rows stay excluded
+    /// (#338/#339 scoping is unchanged). On the score-less FTS5 keyword
+    /// ordering the preference is a stable two-tier sort (current scope
+    /// first). None (default) keeps the strict filter — zero params, zero
+    /// behavior change.
+    pub scope_weight: Option<f64>,
     /// Agent identity filter (v1.2.0). When Some, only entities with a
     /// matching agent_id are returned. None = no agent filtering.
     pub agent_id: Option<String>,
@@ -310,6 +323,7 @@ impl Default for RecallParams {
             diversity_per_query_share: 0.0,
             recency_half_life_secs: None,
             workspace_hash: None,
+            scope_weight: None,
             agent_id: None,
             visibility: None,
             layer: None,

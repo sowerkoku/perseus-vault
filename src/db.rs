@@ -3103,7 +3103,14 @@ impl Database {
             entities.retain(|e| e.always_on == ao);
         }
         if let Some(ref ws) = params.workspace_hash {
-            entities.retain(|e| e.workspace_hash == *ws);
+            // #485: with scope_weight, keep global ('') rows too — they're
+            // the broader scope being down-weighted, not excluded. Other
+            // workspaces are still dropped (#338/#339).
+            if Self::scope_pref(params).is_some() {
+                entities.retain(|e| e.workspace_hash == *ws || e.workspace_hash.is_empty());
+            } else {
+                entities.retain(|e| e.workspace_hash == *ws);
+            }
         }
         if let Some(ref aid) = params.agent_id {
             entities.retain(|e| e.agent_id == *aid);
@@ -3141,6 +3148,9 @@ impl Database {
                     let candidate_k =
                         limit.saturating_mul(5).clamp(1, 1000).max(limit.min(1000));
                     let dense_results = self.dense_search(query_vec, candidate_k)?;
+                    // #485: apply the scope preference while similarity scores
+                    // are still attached, before they're dropped below.
+                    let dense_results = Self::apply_scope_rank_weight(dense_results, params);
                     let mut out: Vec<Entity> = dense_results.into_iter().map(|(e, _)| e).collect();
                     Self::retain_layer(&mut out, params);
                     Self::retain_metadata_filters(&mut out, params);
@@ -3240,6 +3250,9 @@ impl Database {
                 // so a cited-and-reused memory ranked just past `limit` can
                 // still make the cut over a never-reused near-tie.
                 let fused = self.apply_usefulness_rank_boost(fused)?;
+                // #485: scope preference in the same first-phase expression —
+                // broader-scope (global) hits fused at `scope_weight`.
+                let fused = Self::apply_scope_rank_weight(fused, params);
                 let mut out: Vec<Entity> = fused.into_iter().map(|(e, _)| e).collect();
                 Self::retain_layer(&mut out, params);
                 // Apply the same metadata predicates as fts5_search: the dense
@@ -3257,7 +3270,55 @@ impl Database {
 
         let mut results = self.fts5_search(params)?;
         Self::retain_layer(&mut results, params);
+        // #485: the keyword path's ordering carries no relevance score to
+        // multiply, so the scope preference is a stable two-tier sort —
+        // current-workspace hits first, global hits after, each tier keeping
+        // its existing order. (Vec::sort_by_key is stable.)
+        if Self::scope_pref(params).is_some() {
+            results.sort_by_key(|e| e.workspace_hash.is_empty());
+        }
         Ok(results)
+    }
+
+    /// #485: does this params combination activate scope-preference widening?
+    /// Requires an explicit `scope_weight` AND a non-empty workspace to
+    /// prefer — a global ('') caller already IS the broader scope, so
+    /// widening would be a no-op and strict semantics are kept.
+    fn scope_pref(params: &RecallParams) -> Option<(&str, f64)> {
+        match (params.scope_weight, params.workspace_hash.as_deref()) {
+            (Some(w), Some(ws)) if !ws.is_empty() => Some((ws, w.clamp(0.0, 1.0))),
+            _ => None,
+        }
+    }
+
+    /// #485: weight broader-scope (global '') hits by the caller's
+    /// `scope_weight` in a scored result set and re-sort with the same
+    /// deterministic tie-break as RRF (score desc, id asc). In-scope hits
+    /// keep full weight, so a current-workspace hit outranks an
+    /// equally-relevant global one — while a strong global hit can still
+    /// outrank weak local ones instead of being silently invisible.
+    /// Read-only: ranking only, no access-state writes (#247).
+    fn apply_scope_rank_weight(
+        mut scored: Vec<(Entity, f64)>,
+        params: &RecallParams,
+    ) -> Vec<(Entity, f64)> {
+        if let Some((_ws, w)) = Self::scope_pref(params) {
+            let mut changed = false;
+            for (entity, score) in scored.iter_mut() {
+                if entity.workspace_hash.is_empty() {
+                    *score *= w;
+                    changed = true;
+                }
+            }
+            if changed {
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.id.cmp(&b.0.id))
+                });
+            }
+        }
+        scored
     }
 
     /// #487: multiply each fused score by the usefulness weight — memories
@@ -3516,9 +3577,18 @@ impl Database {
         }
 
         // Filter by workspace_hash (v1.2.0 scoping). When set, only entities
-        // in the matching workspace are visible.
+        // in the matching workspace are visible. With scope_weight (#485) the
+        // predicate widens to include GLOBAL ('') rows — and only global
+        // rows; other workspaces stay invisible (#338/#339).
         if let Some(ref ws) = params.workspace_hash {
-            conditions.push(format!("workspace_hash = ?{}", param_values.len() + 1));
+            if Self::scope_pref(params).is_some() {
+                conditions.push(format!(
+                    "(workspace_hash = ?{} OR workspace_hash = '')",
+                    param_values.len() + 1
+                ));
+            } else {
+                conditions.push(format!("workspace_hash = ?{}", param_values.len() + 1));
+            }
             param_values.push(Box::new(ws.clone()));
         }
 
@@ -3849,7 +3919,15 @@ impl Database {
             param_values.push(Box::new(ao as i32));
         }
         if let Some(ref ws) = params.workspace_hash {
-            conditions.push(format!("e.workspace_hash = ?{}", param_values.len() + 1));
+            // #485: same widening as the FTS path — global rows only.
+            if Self::scope_pref(params).is_some() {
+                conditions.push(format!(
+                    "(e.workspace_hash = ?{} OR e.workspace_hash = '')",
+                    param_values.len() + 1
+                ));
+            } else {
+                conditions.push(format!("e.workspace_hash = ?{}", param_values.len() + 1));
+            }
             param_values.push(Box::new(ws.clone()));
         }
         if let Some(ref aid) = params.agent_id {
@@ -16415,6 +16493,128 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    // ─── scope as a ranking multiplier (#485) ────────────────────
+
+    #[test]
+    fn scope_weight_widens_fts5_to_global_but_never_other_workspaces() {
+        let (db, path) = temp_db();
+        let insert = |id: &str, key: &str, ws: &str| {
+            let body = r#"{"note":"grafana dashboard conventions for the fleet"}"#;
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, archived, workspace_hash)
+                     VALUES (?1, 'insight', ?2, ?3, 'insight', 'active', 0, 0, 0, 1.0, 'working', 0, ?4)",
+                    params![id, key, body, ws],
+                )
+                .unwrap();
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities_fts (rowid, body_json)
+                     VALUES ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                    params![id, body],
+                )
+                .unwrap();
+        };
+        insert("s-local", "local-fact", "ws-a");
+        insert("s-global", "global-fact", "");
+        insert("s-other", "other-fact", "ws-b");
+
+        let strict = RecallParams {
+            query: "grafana".to_string(),
+            workspace_hash: Some("ws-a".to_string()),
+            limit: 10,
+            skip_side_effects: true,
+            ..RecallParams::default()
+        };
+        let hits = db.recall(&strict).unwrap();
+        assert_eq!(
+            hits.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["s-local"],
+            "no scope_weight = strict filter, byte-identical to before"
+        );
+
+        let widened = RecallParams {
+            scope_weight: Some(0.5),
+            ..strict
+        };
+        let hits = db.recall(&widened).unwrap();
+        assert_eq!(
+            hits.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["s-local", "s-global"],
+            "scope_weight widens to global with current scope first — and \
+             NEVER surfaces another workspace's rows"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scope_weight_ranks_current_scope_above_equal_global_in_hybrid() {
+        // #485 acceptance: current-scope hits outrank EQUALLY-RELEVANT
+        // broader-scope hits without dropping them. Identical bodies +
+        // embeddings tie every arm; the global twin's id ("e-aaa") would win
+        // the deterministic tie-break, so only the scope multiplier can put
+        // the workspace twin first.
+        let (db, path) = temp_db();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let insert = |id: &str, key: &str, ws: &str| {
+            let body = r#"{"note":"postgres connection pool sizing guidance"}"#;
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, archived, workspace_hash)
+                     VALUES (?1, 'insight', ?2, ?3, 'insight', 'active', 0, 0, 0, 1.0, 'working', ?4, 0, ?5)",
+                    params![id, key, body, blob(&[1.0, 0.0, 0.0]), ws],
+                )
+                .unwrap();
+            db.conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO entities_fts (rowid, body_json)
+                     VALUES ((SELECT rowid FROM entities WHERE id = ?1), ?2)",
+                    params![id, body],
+                )
+                .unwrap();
+        };
+        insert("e-aaa", "global-twin", "");
+        insert("e-bbb", "local-twin", "ws-a");
+
+        let recall_params = RecallParams {
+            query: "postgres".to_string(),
+            mode: crate::models::SearchMode::Hybrid,
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            workspace_hash: Some("ws-a".to_string()),
+            scope_weight: Some(0.5),
+            limit: 10,
+            ..RecallParams::default()
+        };
+        let hits = db.recall(&recall_params).unwrap();
+        assert_eq!(
+            hits.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["e-bbb", "e-aaa"],
+            "current scope outranks its equally-relevant global twin, which \
+             is down-weighted but NOT dropped"
+        );
+
+        // Without scope_weight the strict filter drops the global twin.
+        let strict = RecallParams {
+            scope_weight: None,
+            ..recall_params
+        };
+        let hits = db.recall(&strict).unwrap();
+        assert_eq!(
+            hits.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["e-bbb"],
+            "zero params = zero behavior change"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
     // ─── derived_from usefulness (#487) ──────────────────────────
 
     #[test]
@@ -16841,6 +17041,7 @@ mod tests {
                 diversity_per_query_share: 0.0,
                 recency_half_life_secs: None,
                 workspace_hash: None,
+                scope_weight: None,
             agent_id: None,
             visibility: None,
             layer: None,
@@ -17239,6 +17440,7 @@ mod tests {
                     diversity_per_query_share: 0.0f64,
                     recency_half_life_secs: None,
                     workspace_hash: None,
+                    scope_weight: None,
                     agent_id: None,
                     visibility: None,
                     layer: None,
@@ -17303,6 +17505,7 @@ mod tests {
             diversity_per_query_share: 0.0,
             recency_half_life_secs: None,
             workspace_hash: ws,
+            scope_weight: None,
             agent_id: None,
             visibility: None,
             layer: None,
@@ -17349,6 +17552,7 @@ mod tests {
             mode: crate::models::SearchMode::Fts5, embedding: None, preview_cap: None,
             always_on: None, content_weight: 0.0, trust_weight: 0.0, diversity_halving: 1.0,
             diversity_per_query_share: 0.0, recency_half_life_secs: None, workspace_hash: None,
+            scope_weight: None,
             agent_id: None,
             visibility: None,
             layer: None,

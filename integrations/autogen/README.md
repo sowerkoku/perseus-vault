@@ -3,7 +3,7 @@
 Persistent long-term memory for [AutoGen](https://github.com/microsoft/autogen)
 (AG2 / `autogen-core` v0.4+) agents, backed by [Perseus Vault](https://github.com/Perseus-Computing-LLC/perseus-vault).
 
-`MimirMemory` implements the `autogen_core.memory.Memory` protocol, so it drops
+`PerseusVaultMemory` implements the `autogen_core.memory.Memory` protocol, so it drops
 straight into an `AssistantAgent(memory=[...])`. Stored knowledge is injected
 into the model context before each inference, giving your agents memory that
 survives across sessions, processes, and crews.
@@ -24,11 +24,11 @@ pip install -e integrations/autogen
 import asyncio
 from autogen_agentchat.agents import AssistantAgent
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-from mimir_autogen import MimirMemory
+from perseus_vault_autogen import PerseusVaultMemory
 
 
 async def main():
-    memory = MimirMemory(db_path="~/.mimir/data/agent.db")
+    memory = PerseusVaultMemory(db_path="~/.perseus-vault/data/agent.db")
 
     # Seed a fact
     from autogen_core.memory import MemoryContent, MemoryMimeType
@@ -57,21 +57,21 @@ asyncio.run(main())
 
 | AutoGen `Memory` method | Perseus Vault tool | Behavior |
 |---|---|---|
-| `add(MemoryContent)` | `mimir_remember` | Content → `body_json`; `metadata.category`/`metadata.key` route the entity |
-| `query(text)` | `mimir_recall` | FTS5 keyword search → list of `MemoryContent` |
-| `update_context(ctx)` | `mimir_context` | Prepends the rendered memory block as a `SystemMessage` |
-| `clear()` | `mimir_prune` | Soft-deletes (archives) this memory's category |
-| `close()` | — | Shuts down the persistent Mimir stdio process |
+| `add(MemoryContent)` | `perseus_vault_remember` | Content → `body_json`; `metadata.category`/`metadata.key` route the entity |
+| `query(text)` | `perseus_vault_recall` | FTS5 keyword search → list of `MemoryContent` |
+| `update_context(ctx)` | `perseus_vault_context` | Prepends the rendered memory block as a `SystemMessage` |
+| `clear()` | `perseus_vault_prune` | Soft-deletes (archives) this memory's category |
+| `close()` | — | Shuts down the persistent Perseus Vault stdio process |
 
 ## Configuration
 
 ```python
-MimirMemory(
+PerseusVaultMemory(
     binary="perseus-vault",               # or absolute path: /usr/local/bin/perseus-vault
-    db_path="~/.mimir/data/perseus-vault.db",
+    db_path="~/.perseus-vault/data/perseus-vault.db",
     category="autogen",                   # default category for add()
     context_limit=10,                     # entities injected by update_context()
-    encryption_key="~/.mimir/secret.key", # optional AES-256-GCM at rest
+    encryption_key="~/.perseus-vault/secret.key", # optional AES-256-GCM at rest
     llm_endpoint="http://localhost:11434/api/generate",  # optional, for hybrid search
     llm_model="nomic-embed-text",         # optional embedding/RAG model
 )
@@ -79,7 +79,7 @@ MimirMemory(
 
 ## Notes
 
-- The adapter keeps a **persistent** Mimir stdio session — the process is
+- The adapter keeps a **persistent** Perseus Vault stdio session — the process is
   spawned once and reused across all calls (no per-call cold start). Call
   `await memory.close()` when done, or let `__del__` reap it.
 - `add()` accepts `metadata={"category": ..., "key": ...}` to control where the

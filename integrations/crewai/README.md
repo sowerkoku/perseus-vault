@@ -15,11 +15,11 @@ pip install -e integrations/crewai/
 
 ```python
 from crewai import Agent, Task, Crew
-from mimir_crewai import MimirMemoryTool
+from perseus_vault_crewai import PerseusVaultMemoryTool
 
 # Create the memory tool
-memory = MimirMemoryTool(
-    db_path="~/.mimir/data/crew.db"
+memory = PerseusVaultMemoryTool(
+    db_path="~/.perseus-vault/data/crew.db"
 )
 
 # Give it to your agents
@@ -57,12 +57,12 @@ result = crew.kickoff()
 
 ## How It Works
 
-The `MimirMemoryTool` wraps Perseus Vault's MCP tools as a CrewAI tool:
+The `PerseusVaultMemoryTool` wraps Perseus Vault's MCP tools as a CrewAI tool:
 
-- `remember` → `mimir_remember`
-- `recall` → `mimir_recall`
-- `journal` → `mimir_journal`
-- `context` → `mimir_context`
+- `remember` → `perseus_vault_remember`
+- `recall` → `perseus_vault_recall`
+- `journal` → `perseus_vault_journal`
+- `context` → `perseus_vault_context`
 
 All memories persist across sessions and crews. Agents can build up
 a shared knowledge base over time.

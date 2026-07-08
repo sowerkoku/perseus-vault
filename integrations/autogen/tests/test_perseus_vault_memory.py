@@ -1,8 +1,8 @@
-"""Tests for the AutoGen MimirMemory adapter.
+"""Tests for the AutoGen PerseusVaultMemory adapter.
 
 autogen-core (and its dependency tree) need not be installed to exercise the
-Mimir wiring: we stub the ``autogen_core`` modules the adapter imports with
-minimal stand-ins, then drive the memory against Mimir's real MCP JSON-RPC
+Perseus Vault wiring: we stub the ``autogen_core`` modules the adapter imports with
+minimal stand-ins, then drive the memory against Perseus Vault's real MCP JSON-RPC
 envelope via a fake persistent-stdio subprocess.
 """
 
@@ -19,7 +19,7 @@ import pytest
 # ── stub autogen_core before importing the adapter ──────────────────
 
 @pytest.fixture(scope="module")
-def MimirMemory():
+def PerseusVaultMemory():
     if "autogen_core" not in sys.modules:
         core = types.ModuleType("autogen_core")
         memory_mod = types.ModuleType("autogen_core.memory")
@@ -77,7 +77,7 @@ def MimirMemory():
         sys.modules["autogen_core.model_context"] = model_ctx_mod
         sys.modules["autogen_core.models"] = models_mod
 
-    from mimir_autogen import MimirMemory as cls
+    from perseus_vault_autogen import PerseusVaultMemory as cls
     return cls
 
 
@@ -165,7 +165,7 @@ def _run(coro):
 
 # ── tests ───────────────────────────────────────────────────────────
 
-def test_add_sends_remember_with_routing(monkeypatch, MimirMemory):
+def test_add_sends_remember_with_routing(monkeypatch, PerseusVaultMemory):
     from autogen_core.memory import MemoryContent, MemoryMimeType
 
     captured = {}
@@ -175,9 +175,9 @@ def test_add_sends_remember_with_routing(monkeypatch, MimirMemory):
         return {"id": "mem-1", "status": "ok"}
 
     monkeypatch.setattr(
-        "mimir_autogen.subprocess.Popen", _fake_popen({"mimir_remember": remember})
+        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_remember": remember})
     )
-    mem = MimirMemory()
+    mem = PerseusVaultMemory()
     content = MemoryContent(
         content="user prefers dark mode",
         mime_type=MemoryMimeType.TEXT,
@@ -191,7 +191,7 @@ def test_add_sends_remember_with_routing(monkeypatch, MimirMemory):
     assert captured["type"] == "autogen_memory"
 
 
-def test_add_auto_key_when_missing(monkeypatch, MimirMemory):
+def test_add_auto_key_when_missing(monkeypatch, PerseusVaultMemory):
     from autogen_core.memory import MemoryContent, MemoryMimeType
 
     captured = {}
@@ -201,16 +201,16 @@ def test_add_auto_key_when_missing(monkeypatch, MimirMemory):
         return {"status": "ok"}
 
     monkeypatch.setattr(
-        "mimir_autogen.subprocess.Popen", _fake_popen({"mimir_remember": remember})
+        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_remember": remember})
     )
-    mem = MimirMemory(category="autogen")
+    mem = PerseusVaultMemory(category="autogen")
     _run(mem.add(MemoryContent(content="x", mime_type=MemoryMimeType.TEXT)))
 
     assert captured["category"] == "autogen"
     assert captured["key"].startswith("autogen-")
 
 
-def test_query_parses_structured_items(monkeypatch, MimirMemory):
+def test_query_parses_structured_items(monkeypatch, PerseusVaultMemory):
     def recall(args):
         return {
             "items": [
@@ -225,9 +225,9 @@ def test_query_parses_structured_items(monkeypatch, MimirMemory):
         }
 
     monkeypatch.setattr(
-        "mimir_autogen.subprocess.Popen", _fake_popen({"mimir_recall": recall})
+        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_recall": recall})
     )
-    mem = MimirMemory()
+    mem = PerseusVaultMemory()
     result = _run(mem.query("theme"))
 
     assert len(result.results) == 1
@@ -237,16 +237,16 @@ def test_query_parses_structured_items(monkeypatch, MimirMemory):
     assert item.metadata["key"] == "theme"
 
 
-def test_update_context_injects_system_message(monkeypatch, MimirMemory):
+def test_update_context_injects_system_message(monkeypatch, PerseusVaultMemory):
     from autogen_core.model_context import ChatCompletionContext
 
     def context(args):
         return {"context": "## Memory\n- user prefers dark mode"}
 
     monkeypatch.setattr(
-        "mimir_autogen.subprocess.Popen", _fake_popen({"mimir_context": context})
+        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_context": context})
     )
-    mem = MimirMemory()
+    mem = PerseusVaultMemory()
     ctx = ChatCompletionContext()
     result = _run(mem.update_context(ctx))
 
@@ -255,16 +255,16 @@ def test_update_context_injects_system_message(monkeypatch, MimirMemory):
     assert len(result.memories.results) == 1
 
 
-def test_update_context_empty_is_noop(monkeypatch, MimirMemory):
+def test_update_context_empty_is_noop(monkeypatch, PerseusVaultMemory):
     from autogen_core.model_context import ChatCompletionContext
 
     def context(args):
         return {"context": ""}
 
     monkeypatch.setattr(
-        "mimir_autogen.subprocess.Popen", _fake_popen({"mimir_context": context})
+        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_context": context})
     )
-    mem = MimirMemory()
+    mem = PerseusVaultMemory()
     ctx = ChatCompletionContext()
     result = _run(mem.update_context(ctx))
 
@@ -272,7 +272,7 @@ def test_update_context_empty_is_noop(monkeypatch, MimirMemory):
     assert result.memories.results == []
 
 
-def test_clear_prunes_category(monkeypatch, MimirMemory):
+def test_clear_prunes_category(monkeypatch, PerseusVaultMemory):
     captured = {}
 
     def prune(args):
@@ -280,14 +280,14 @@ def test_clear_prunes_category(monkeypatch, MimirMemory):
         return {"archived": 3}
 
     monkeypatch.setattr(
-        "mimir_autogen.subprocess.Popen", _fake_popen({"mimir_prune": prune})
+        "perseus_vault_autogen.subprocess.Popen", _fake_popen({"perseus_vault_prune": prune})
     )
-    mem = MimirMemory(category="autogen")
+    mem = PerseusVaultMemory(category="autogen")
     _run(mem.clear())
     assert captured["category"] == "autogen"
 
 
-def test_unwrap_handles_text_only_envelope(MimirMemory):
-    assert MimirMemory._unwrap_result(
+def test_unwrap_handles_text_only_envelope(PerseusVaultMemory):
+    assert PerseusVaultMemory._unwrap_result(
         {"content": [{"type": "text", "text": json.dumps({"items": [1, 2]})}]}
     ) == {"items": [1, 2]}

@@ -1,4 +1,4 @@
-# mimir-persist
+# perseus-vault-persist
 
 **Persistent FastMCP `EventStore` over SQLite.** Drop-in SSE stream
 resumability for any [FastMCP](https://github.com/modelcontextprotocol/python-sdk)
@@ -6,14 +6,14 @@ resumability for any [FastMCP](https://github.com/modelcontextprotocol/python-sd
 replay the events they missed.
 
 This is **MCP infrastructure** — a persistent `EventStore` backend that lives
-*below* the tool layer. It is **not** a "Mimir Python library" and does not
-expose Mimir's memory tools. It implements the MCP Python SDK's real
+*below* the tool layer. It is **not** a "Perseus Vault Python library" and does not
+expose Perseus Vault's memory tools. It implements the MCP Python SDK's real
 `EventStore` ABC and stores events in its own dedicated SQLite file.
 
 ## Install
 
 ```bash
-pip install -e integrations/mimir-persist/
+pip install -e integrations/perseus-vault-persist/
 ```
 
 This pulls in the pinned `mcp==1.28.1` SDK (the `EventStore` ABC signature is
@@ -22,11 +22,11 @@ SDK-version specific).
 ## Quick Start
 
 ```python
-from mimir_persist import MimirEventStore
+from perseus_vault_persist import PerseusVaultEventStore
 from mcp.server.fastmcp import FastMCP
 
 # Persist SSE events to a dedicated SQLite file.
-store = MimirEventStore(db_path="~/.mimir/data/mcp_events.db")
+store = PerseusVaultEventStore(db_path="~/.perseus-vault/data/mcp_events.db")
 
 mcp = FastMCP("my-server", event_store=store)
 ```
@@ -37,7 +37,7 @@ between.
 
 ## Interface
 
-`MimirEventStore` implements the real
+`PerseusVaultEventStore` implements the real
 `mcp.server.streamable_http.EventStore` ABC:
 
 | Method | Purpose |
@@ -59,7 +59,7 @@ Plus a retention helper that is **not** part of the ABC:
 ## Storage model
 
 Events are stored in a **dedicated `events` table** in their **own** SQLite
-file — never in Mimir's Rust `entities` table.
+file — never in Perseus Vault's Rust `entities` table.
 
 ```sql
 CREATE TABLE events (
@@ -79,9 +79,9 @@ readers) and writes are serialised behind an `asyncio.Lock` so the monotonic
 ## ⚠️ Encryption: plaintext payloads
 
 **Event payloads in this database are PLAINTEXT.** This store does **NOT**
-share Mimir's AES-256-GCM encryption.
+share Perseus Vault's AES-256-GCM encryption.
 
-Mimir's AES-256-GCM is implemented in the **Rust core** and applies only at the
+Perseus Vault's AES-256-GCM is implemented in the **Rust core** and applies only at the
 **column level** to `entities.body_json`. It does **not** extend to this
 separate, Python-side events database. If your JSON-RPC traffic is sensitive,
 encrypt the DB file at the OS/volume level. Optional Python-side payload

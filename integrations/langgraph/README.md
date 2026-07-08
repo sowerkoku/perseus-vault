@@ -14,12 +14,12 @@ pip install -e integrations/langgraph/
 ## Quick Start
 
 ```python
-from mimir_langgraph import MimirStore
+from perseus_vault_langgraph import PerseusVaultStore
 
 # Create a Perseus Vault-backed store
-store = MimirStore(
+store = PerseusVaultStore(
     binary="perseus-vault",  # or /usr/local/bin/perseus-vault
-    db_path="~/.mimir/data/perseus-vault.db",
+    db_path="~/.perseus-vault/data/perseus-vault.db",
 )
 
 # Use as a drop-in BaseStore replacement
@@ -39,10 +39,10 @@ for r in results:
 ```python
 from langgraph.graph import StateGraph
 from langgraph.store.base import BaseStore
-from mimir_langgraph import MimirStore
+from perseus_vault_langgraph import PerseusVaultStore
 
-# Use MimirStore as your long-term memory
-store = MimirStore()
+# Use PerseusVaultStore as your long-term memory
+store = PerseusVaultStore()
 
 # Build your graph with store
 graph = (
@@ -60,7 +60,7 @@ from previous interactions using `store.search()`.
 | Parameter | Default | Description |
 |---|---|---|
 | `binary` | `"perseus-vault"` | Path to the perseus-vault binary |
-| `db_path` | `"~/.mimir/data/perseus-vault.db"` | Path to the SQLite database |
+| `db_path` | `"~/.perseus-vault/data/perseus-vault.db"` | Path to the SQLite database |
 | `timeout` | `30.0` | Tool call timeout in seconds |
 | `encryption_key` | `None` | Path to AES-256-GCM key file |
 | `ollama_url` | `None` | Ollama endpoint for hybrid search |
@@ -75,9 +75,9 @@ LangGraph's BaseStore interface maps cleanly onto Perseus Vault's entity model:
 | `namespace: tuple[str, ...]` | `category: str` (joined with `/`) |
 | `key: str` | `key: str` |
 | `value: dict` | `body_json: str` (JSON) |
-| `search()` | `mimir_recall` (FTS5) |
-| `put()` | `mimir_remember` |
-| `delete()` | `mimir_forget` |
+| `search()` | `perseus_vault_recall` (FTS5) |
+| `put()` | `perseus_vault_remember` |
+| `delete()` | `perseus_vault_forget` |
 
 ## Requirements
 

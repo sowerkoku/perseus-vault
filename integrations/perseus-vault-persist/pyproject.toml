@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mimir-persist"
+name = "perseus-vault-persist"
 version = "0.1.0"
 description = "Persistent FastMCP EventStore over SQLite — SSE resumability for MCP servers"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Perseus Computing LLC" }]
-keywords = ["mcp", "fastmcp", "eventstore", "sse", "resumability", "mimir"]
+keywords = ["mcp", "fastmcp", "eventstore", "sse", "resumability", "perseus-vault"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -26,11 +26,11 @@ dependencies = [
 dev = ["pytest", "pytest-asyncio"]
 
 [project.urls]
-Homepage = "https://github.com/Perseus-Computing-LLC/mneme"
-Repository = "https://github.com/Perseus-Computing-LLC/mneme"
+Homepage = "https://github.com/Perseus-Computing-LLC/perseus-vault"
+Repository = "https://github.com/Perseus-Computing-LLC/perseus-vault"
 
 [tool.setuptools]
-packages = ["mimir_persist"]
+packages = ["perseus_vault_persist"]
 package-dir = { "" = "." }
 
 [tool.pytest.ini_options]

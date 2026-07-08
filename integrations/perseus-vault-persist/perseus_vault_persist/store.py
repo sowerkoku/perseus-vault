@@ -1,7 +1,7 @@
 """
-MimirEventStore — a persistent FastMCP ``EventStore`` backed by SQLite.
+PerseusVaultEventStore — a persistent FastMCP ``EventStore`` backed by SQLite.
 
-This is **MCP infrastructure**, not a "Mimir Python library". It gives any
+This is **MCP infrastructure**, not a "Perseus Vault Python library". It gives any
 FastMCP / Streamable-HTTP server SSE *stream resumability* across restarts by
 durably persisting the JSON-RPC events that flow over a session's SSE streams.
 When a client reconnects with a ``Last-Event-ID``, the transport asks this store
@@ -16,16 +16,16 @@ plus a ``cleanup_before(...)`` retention helper (not part of the ABC).
 
 Usage::
 
-    from mimir_persist import MimirEventStore
+    from perseus_vault_persist import PerseusVaultEventStore
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("my-server", event_store=MimirEventStore())
+    mcp = FastMCP("my-server", event_store=PerseusVaultEventStore())
 
 Storage model
 -------------
 Events live in a **dedicated** ``events`` table in their **own** SQLite file
-(default ``~/.mimir/data/mcp_events.db``). This is deliberately separate from
-Mimir's Rust ``entities`` table — the two never share a table or a file.
+(default ``~/.perseus-vault/data/mcp_events.db``). This is deliberately separate from
+Perseus Vault's Rust ``entities`` table — the two never share a table or a file.
 
     CREATE TABLE events (
         event_id   TEXT PRIMARY KEY,   -- opaque UUID handed back to the client
@@ -38,8 +38,8 @@ Mimir's Rust ``entities`` table — the two never share a table or a file.
 
 .. warning::
 
-   **Payloads are stored as PLAINTEXT.** This store does **NOT** share Mimir's
-   AES-256-GCM encryption. That encryption is implemented in Mimir's Rust core
+   **Payloads are stored as PLAINTEXT.** This store does **NOT** share Perseus Vault's
+   AES-256-GCM encryption. That encryption is implemented in Perseus Vault's Rust core
    and only ever applies at the *column* level to ``entities.body_json`` — it
    does not extend to this separate events database. If your JSON-RPC traffic
    carries sensitive data, encrypt the database file at the OS/volume level, or
@@ -71,19 +71,19 @@ from mcp.server.streamable_http import (
 )
 from mcp.types import JSONRPCMessage
 
-__all__ = ["MimirEventStore"]
+__all__ = ["PerseusVaultEventStore"]
 
 
-class MimirEventStore(EventStore):
+class PerseusVaultEventStore(EventStore):
     """Durable SQLite-backed :class:`EventStore` for FastMCP SSE resumability.
 
     Args:
         db_path: Path to the dedicated events SQLite file. Created (with parent
-            dirs) on first use. Defaults to ``~/.mimir/data/mcp_events.db``.
-            This file is **separate** from Mimir's entity database.
+            dirs) on first use. Defaults to ``~/.perseus-vault/data/mcp_events.db``.
+            This file is **separate** from Perseus Vault's entity database.
     """
 
-    def __init__(self, db_path: str = "~/.mimir/data/mcp_events.db") -> None:
+    def __init__(self, db_path: str = "~/.perseus-vault/data/mcp_events.db") -> None:
         self.db_path = str(Path(db_path).expanduser())
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = asyncio.Lock()

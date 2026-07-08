@@ -1,17 +1,17 @@
 """
-MimirMemory — AutoGen ``Memory`` implementation backed by Mimir.
+PerseusVaultMemory — AutoGen ``Memory`` implementation backed by Perseus Vault.
 
 Drop-in persistent long-term memory for AutoGen (AG2 / autogen-core v0.4+)
-agents. Implements the ``autogen_core.memory.Memory`` protocol so a Mimir
+agents. Implements the ``autogen_core.memory.Memory`` protocol so a Perseus Vault
 database can be attached to any ``AssistantAgent`` and its stored knowledge is
 injected into the model context before each inference.
 
 Usage:
     from autogen_agentchat.agents import AssistantAgent
     from autogen_ext.models.openai import OpenAIChatCompletionClient
-    from mimir_autogen import MimirMemory
+    from perseus_vault_autogen import PerseusVaultMemory
 
-    memory = MimirMemory(db_path="~/.mimir/data/agent.db")
+    memory = PerseusVaultMemory(db_path="~/.perseus-vault/data/agent.db")
 
     agent = AssistantAgent(
         name="assistant",
@@ -19,14 +19,14 @@ Usage:
         memory=[memory],
     )
 
-The adapter maps AutoGen's ``MemoryContent`` model onto Mimir's entity model:
+The adapter maps AutoGen's ``MemoryContent`` model onto Perseus Vault's entity model:
 
-    MemoryContent.content   → Mimir body_json {"content": ...}
+    MemoryContent.content   → Perseus Vault body_json {"content": ...}
     MemoryContent.metadata  → merged into body_json (category/key extracted)
-    query(text)             → Mimir FTS5 recall
-    update_context()        → prepends a Mimir context block as a SystemMessage
+    query(text)             → Perseus Vault FTS5 recall
+    update_context()        → prepends a Perseus Vault context block as a SystemMessage
 
-It keeps a persistent Mimir stdio session — the process is spawned once and
+It keeps a persistent Perseus Vault stdio session — the process is spawned once and
 reused across all calls, avoiding per-call cold-start overhead (process spawn +
 DB open + init handshake).
 """
@@ -55,10 +55,10 @@ from autogen_core.models import SystemMessage
 logger = logging.getLogger(__name__)
 
 
-class MimirMemory(Memory):
-    """AutoGen ``Memory`` backed by a local Mimir MCP server.
+class PerseusVaultMemory(Memory):
+    """AutoGen ``Memory`` backed by a local Perseus Vault MCP server.
 
-    Mimir is a local-first persistent memory engine with structured entities,
+    Perseus Vault is a local-first persistent memory engine with structured entities,
     journal events, and state management. This adapter implements the four
     ``Memory`` protocol methods (``add``, ``query``, ``update_context``,
     ``clear``) plus ``close`` so it can be passed directly to an
@@ -67,8 +67,8 @@ class MimirMemory(Memory):
 
     def __init__(
         self,
-        binary: str = "mimir",
-        db_path: str = "~/.mimir/data/mimir.db",
+        binary: str = "perseus-vault",
+        db_path: str = "~/.perseus-vault/data/perseus-vault.db",
         timeout: float = 30.0,
         category: str = "autogen",
         context_limit: int = 10,
@@ -76,18 +76,18 @@ class MimirMemory(Memory):
         llm_endpoint: Optional[str] = None,
         llm_model: Optional[str] = None,
     ):
-        """Initialize the Mimir-backed memory.
+        """Initialize the Perseus Vault-backed memory.
 
         Args:
-            binary: Path to the mimir binary (default: finds on PATH)
-            db_path: Path to the Mimir SQLite database
+            binary: Path to the perseus-vault binary (default: finds on PATH)
+            db_path: Path to the Perseus Vault SQLite database
             timeout: Command timeout in seconds
-            category: Default Mimir category for stored memories
+            category: Default Perseus Vault category for stored memories
             context_limit: Max entities to inject in ``update_context``
             encryption_key: Optional path to AES-256-GCM key file
             llm_endpoint: Optional LLM endpoint (e.g. Ollama
                 ``http://localhost:11434/api/generate``) for hybrid search
-            llm_model: Optional model name used for embeddings / ``mimir_ask``
+            llm_model: Optional model name used for embeddings / ``perseus_vault_ask``
         """
         self.binary = binary
         self.db_path = str(Path(db_path).expanduser())
@@ -106,7 +106,7 @@ class MimirMemory(Memory):
     # ── session management ──────────────────────────────────────────
 
     def _ensure_session(self):
-        """Spawn a persistent mimir process if one isn't already running."""
+        """Spawn a persistent perseus-vault process if one isn't already running."""
         if self._proc is not None and self._proc.poll() is None:
             return  # already alive
 
@@ -135,7 +135,7 @@ class MimirMemory(Memory):
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "autogen-mimir", "version": "1.0.0"},
+                "clientInfo": {"name": "autogen-perseus-vault", "version": "1.0.0"},
             },
         })
         try:
@@ -143,7 +143,7 @@ class MimirMemory(Memory):
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
             self._proc = None
-            raise RuntimeError("Failed to initialize mimir process")
+            raise RuntimeError("Failed to initialize perseus-vault process")
 
         # Read the initialize response (ignore — just consume it)
         self._read_response(init_id)
@@ -178,7 +178,7 @@ class MimirMemory(Memory):
         return None
 
     def _close_session(self):
-        """Shut down the persistent mimir process."""
+        """Shut down the persistent perseus-vault process."""
         if self._proc is None:
             return
         try:
@@ -199,9 +199,9 @@ class MimirMemory(Memory):
 
     @staticmethod
     def _unwrap_result(result: dict) -> dict:
-        """Unwrap an MCP ``tools/call`` result into Mimir's payload dict.
+        """Unwrap an MCP ``tools/call`` result into Perseus Vault's payload dict.
 
-        Mimir returns the standard MCP envelope::
+        Perseus Vault returns the standard MCP envelope::
 
             {"content": [{"type": "text", "text": "<json>"}],
              "structuredContent": {...parsed json...}}
@@ -224,8 +224,8 @@ class MimirMemory(Memory):
                 return parsed
         return {}
 
-    def _call_mimir(self, method: str, params: dict) -> dict:
-        """Call a Mimir MCP tool via the persistent stdio session."""
+    def _call_perseus_vault(self, method: str, params: dict) -> dict:
+        """Call a Perseus Vault MCP tool via the persistent stdio session."""
         with self._lock:
             try:
                 self._ensure_session()
@@ -245,12 +245,12 @@ class MimirMemory(Memory):
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._proc = None
-                return {"error": "mimir process died — call re-spawns"}
+                return {"error": "perseus-vault process died — call re-spawns"}
 
             response = self._read_response(req_id)
             if response is None:
                 self._close_session()
-                return {"error": "no response from mimir (process may have exited)"}
+                return {"error": "no response from perseus-vault (process may have exited)"}
             if response.get("error"):
                 return {"error": response["error"]}
             return self._unwrap_result(response.get("result", {}))
@@ -262,9 +262,9 @@ class MimirMemory(Memory):
         content: MemoryContent,
         cancellation_token: CancellationToken | None = None,
     ) -> None:
-        """Store a ``MemoryContent`` entry in Mimir.
+        """Store a ``MemoryContent`` entry in Perseus Vault.
 
-        Maps to ``mimir_remember``. The content text becomes ``body_json``;
+        Maps to ``perseus_vault_remember``. The content text becomes ``body_json``;
         ``metadata`` may carry an explicit ``category``/``key``, otherwise an
         auto key is generated.
         """
@@ -279,14 +279,14 @@ class MimirMemory(Memory):
             if k not in ("category", "key"):
                 body[k] = v
 
-        result = self._call_mimir("mimir_remember", {
+        result = self._call_perseus_vault("perseus_vault_remember", {
             "category": category,
             "key": key,
             "body_json": json.dumps(body),
             "type": metadata.get("type", "autogen_memory"),
         })
         if "error" in result:
-            logger.warning("MimirMemory.add failed: %s", result["error"])
+            logger.warning("PerseusVaultMemory.add failed: %s", result["error"])
 
     async def query(
         self,
@@ -294,10 +294,10 @@ class MimirMemory(Memory):
         cancellation_token: CancellationToken | None = None,
         **kwargs: Any,
     ) -> MemoryQueryResult:
-        """Search stored memories via Mimir FTS5 recall.
+        """Search stored memories via Perseus Vault FTS5 recall.
 
         Returns a ``MemoryQueryResult`` whose ``results`` is a list of
-        ``MemoryContent`` reconstructed from Mimir entities.
+        ``MemoryContent`` reconstructed from Perseus Vault entities.
         """
         query_text = query if isinstance(query, str) else self._content_to_text(query)
         limit = int(kwargs.get("limit", self.context_limit))
@@ -307,7 +307,7 @@ class MimirMemory(Memory):
         if category:
             params["category"] = category
 
-        result = self._call_mimir("mimir_recall", params)
+        result = self._call_perseus_vault("perseus_vault_recall", params)
         items = result.get("items", []) if "error" not in result else []
 
         results: list[MemoryContent] = []
@@ -334,15 +334,15 @@ class MimirMemory(Memory):
         self,
         model_context: ChatCompletionContext,
     ) -> UpdateContextResult:
-        """Inject Mimir's context block into the model context.
+        """Inject Perseus Vault's context block into the model context.
 
-        Calls ``mimir_context`` and prepends the rendered markdown block as a
+        Calls ``perseus_vault_context`` and prepends the rendered markdown block as a
         ``SystemMessage`` so the agent starts each turn with its persistent
         memory loaded. Returns the memories used for transparency/telemetry.
         """
-        result = self._call_mimir("mimir_context", {"limit": self.context_limit})
+        result = self._call_perseus_vault("perseus_vault_context", {"limit": self.context_limit})
         if "error" in result:
-            logger.warning("MimirMemory.update_context failed: %s", result["error"])
+            logger.warning("PerseusVaultMemory.update_context failed: %s", result["error"])
             return UpdateContextResult(memories=MemoryQueryResult(results=[]))
 
         context_text = result.get("context", "")
@@ -350,7 +350,7 @@ class MimirMemory(Memory):
             return UpdateContextResult(memories=MemoryQueryResult(results=[]))
 
         await model_context.add_message(
-            SystemMessage(content=f"Relevant memory context from Mimir:\n{context_text}")
+            SystemMessage(content=f"Relevant memory context from Perseus Vault:\n{context_text}")
         )
 
         memory = MemoryContent(content=context_text, mime_type=MemoryMimeType.TEXT)
@@ -359,15 +359,15 @@ class MimirMemory(Memory):
     async def clear(self) -> None:
         """Clear stored memories for this memory's category.
 
-        Maps to ``mimir_prune`` scoped to the configured category. This is a
+        Maps to ``perseus_vault_prune`` scoped to the configured category. This is a
         soft-delete (archived=1) — entities are recoverable, not destroyed.
         """
-        result = self._call_mimir("mimir_prune", {"category": self.category})
+        result = self._call_perseus_vault("perseus_vault_prune", {"category": self.category})
         if "error" in result:
-            logger.warning("MimirMemory.clear failed: %s", result["error"])
+            logger.warning("PerseusVaultMemory.clear failed: %s", result["error"])
 
     async def close(self) -> None:
-        """Shut down the persistent Mimir process."""
+        """Shut down the persistent Perseus Vault process."""
         self._close_session()
 
     # ── helpers ─────────────────────────────────────────────────────
@@ -390,14 +390,14 @@ class MimirMemory(Memory):
 
 
 # Convenience helper
-def create_mimir_memory(
-    db_path: str = "~/.mimir/data/mimir.db",
+def create_perseus_vault_memory(
+    db_path: str = "~/.perseus-vault/data/perseus-vault.db",
     **kwargs,
-) -> MimirMemory:
-    """Create a MimirMemory with sensible defaults.
+) -> PerseusVaultMemory:
+    """Create a PerseusVaultMemory with sensible defaults.
 
     Args:
-        db_path: Path to the Mimir database
-        **kwargs: Additional MimirMemory arguments
+        db_path: Path to the Perseus Vault database
+        **kwargs: Additional PerseusVaultMemory arguments
     """
-    return MimirMemory(db_path=db_path, **kwargs)
+    return PerseusVaultMemory(db_path=db_path, **kwargs)

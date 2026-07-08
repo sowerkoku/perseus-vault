@@ -1,7 +1,7 @@
-"""Tests for MimirStore — the LangGraph BaseStore backed by Mimir.
+"""Tests for PerseusVaultStore — the LangGraph BaseStore backed by Perseus Vault.
 
-These mock the ``mimir`` subprocess with the *real* MCP JSON-RPC envelope
-Mimir emits (``result.structuredContent`` / ``result.content[0].text``), so
+These mock the ``perseus-vault`` subprocess with the *real* MCP JSON-RPC envelope
+Perseus Vault emits (``result.structuredContent`` / ``result.content[0].text``), so
 they pin the response-parsing contract without needing the Rust binary.
 """
 
@@ -12,16 +12,16 @@ from datetime import datetime
 
 import pytest
 
-from mimir_langgraph import MimirStore
+from perseus_vault_langgraph import PerseusVaultStore
 
 
 def _make_fake_popen(routes):
     """Build a fake ``subprocess.Popen`` driven by ``routes``.
 
-    ``routes`` maps a Mimir tool name to a callable(arguments) -> payload dict.
+    ``routes`` maps a Perseus Vault tool name to a callable(arguments) -> payload dict.
     The fake drives the persistent stdio session the store uses (write/readline,
     not communicate): each ``initialize`` write gets an empty result and each
-    ``tools/call`` write gets the routed payload in Mimir's real MCP envelope.
+    ``tools/call`` write gets the routed payload in Perseus Vault's real MCP envelope.
     """
 
     class FakeStdout:
@@ -97,12 +97,12 @@ def _make_fake_popen(routes):
 
 
 def _patch(monkeypatch, routes):
-    monkeypatch.setattr("mimir_langgraph.subprocess.Popen", _make_fake_popen(routes))
+    monkeypatch.setattr("perseus_vault_langgraph.subprocess.Popen", _make_fake_popen(routes))
 
 
 def test_get_parses_structured_content(monkeypatch):
     routes = {
-        "mimir_recall": lambda a: {
+        "perseus_vault_recall": lambda a: {
             "items": [
                 {
                     "key": "prefs",
@@ -117,7 +117,7 @@ def test_get_parses_structured_content(monkeypatch):
         }
     }
     _patch(monkeypatch, routes)
-    store = MimirStore()
+    store = PerseusVaultStore()
 
     item = store.get(("users", "123"), "prefs")
     assert item is not None
@@ -128,14 +128,14 @@ def test_get_parses_structured_content(monkeypatch):
 
 
 def test_get_returns_none_when_no_match(monkeypatch):
-    _patch(monkeypatch, {"mimir_recall": lambda a: {"items": [], "total": 0}})
-    store = MimirStore()
+    _patch(monkeypatch, {"perseus_vault_recall": lambda a: {"items": [], "total": 0}})
+    store = PerseusVaultStore()
     assert store.get(("users", "123"), "missing") is None
 
 
 def test_search_maps_items_and_score(monkeypatch):
     routes = {
-        "mimir_recall": lambda a: {
+        "perseus_vault_recall": lambda a: {
             "items": [
                 {
                     "key": "n1",
@@ -148,7 +148,7 @@ def test_search_maps_items_and_score(monkeypatch):
         }
     }
     _patch(monkeypatch, routes)
-    store = MimirStore()
+    store = PerseusVaultStore()
 
     results = store.search(("notes",), query="hello")
     assert len(results) == 1
@@ -164,26 +164,26 @@ def test_put_sends_type_not_entity_type(monkeypatch):
         captured.update(args)
         return {"id": "mem-1", "status": "ok"}
 
-    _patch(monkeypatch, {"mimir_remember": remember})
-    store = MimirStore()
+    _patch(monkeypatch, {"perseus_vault_remember": remember})
+    store = PerseusVaultStore()
 
     store.put(("users", "123"), "prefs", {"theme": "dark"})
     assert captured["category"] == "users/123"
     assert captured["key"] == "prefs"
     assert json.loads(captured["body_json"]) == {"theme": "dark"}
-    # Regression: Mimir's param is ``type``; ``entity_type`` was silently dropped.
+    # Regression: Perseus Vault's param is ``type``; ``entity_type`` was silently dropped.
     assert captured.get("type") == "langgraph_item"
     assert "entity_type" not in captured
 
 
 def test_list_namespaces_reads_by_category(monkeypatch):
     routes = {
-        "mimir_stats": lambda a: {
+        "perseus_vault_stats": lambda a: {
             "by_category": {"users/123": 3, "notes": 5, "default": 1}
         }
     }
     _patch(monkeypatch, routes)
-    store = MimirStore()
+    store = PerseusVaultStore()
 
     namespaces = store.list_namespaces()
     assert ("users", "123") in namespaces
@@ -192,12 +192,12 @@ def test_list_namespaces_reads_by_category(monkeypatch):
 
 def test_unwrap_prefers_structured_then_text():
     # structuredContent wins when present.
-    assert MimirStore._unwrap_result(
+    assert PerseusVaultStore._unwrap_result(
         {"structuredContent": {"items": [1]}, "content": [{"text": "{}"}]}
     ) == {"items": [1]}
     # Falls back to parsing content[0].text JSON.
-    assert MimirStore._unwrap_result(
+    assert PerseusVaultStore._unwrap_result(
         {"content": [{"type": "text", "text": json.dumps({"items": [2]})}]}
     ) == {"items": [2]}
     # Garbage text yields an empty dict rather than blowing up.
-    assert MimirStore._unwrap_result({"content": [{"text": "not json"}]}) == {}
+    assert PerseusVaultStore._unwrap_result({"content": [{"text": "not json"}]}) == {}

@@ -1,11 +1,11 @@
 """
-CrewAI Mimir Memory Tool — provides persistent memory for CrewAI agents.
+CrewAI Perseus Vault Memory Tool — provides persistent memory for CrewAI agents.
 
 Usage:
     from crewai import Agent, Task, Crew
-    from mimir_crewai import MimirMemoryTool
+    from perseus_vault_crewai import PerseusVaultMemoryTool
 
-    memory = MimirMemoryTool(db_path="~/.mimir/data/crew.db")
+    memory = PerseusVaultMemoryTool(db_path="~/.perseus-vault/data/crew.db")
 
     agent = Agent(
         role="Researcher",
@@ -23,8 +23,8 @@ from typing import Optional, Any
 from crewai.tools import BaseTool
 
 
-class MimirMemoryTool(BaseTool):
-    """CrewAI tool that provides persistent memory via Mimir.
+class PerseusVaultMemoryTool(BaseTool):
+    """CrewAI tool that provides persistent memory via Perseus Vault.
 
     Agents can remember facts, recall past decisions, and search
     the knowledge base — all persisted across sessions and crews.
@@ -35,12 +35,12 @@ class MimirMemoryTool(BaseTool):
         journal   — Record a significant event
         context   — Get the current session context summary
 
-    The tool keeps a persistent Mimir stdio session — the process is
+    The tool keeps a persistent Perseus Vault stdio session — the process is
     spawned once and reused across all calls.  This avoids the per-call
     cold-start overhead (process spawn + DB open + init handshake).
     """
 
-    name: str = "Mimir Memory"
+    name: str = "Perseus Vault Memory"
     description: str = (
         "Persistent memory tool for storing and retrieving information "
         "across sessions. Use this to remember facts, recall past "
@@ -53,8 +53,8 @@ class MimirMemoryTool(BaseTool):
 
     def __init__(
         self,
-        binary: str = "mimir",
-        db_path: str = "~/.mimir/data/crew.db",
+        binary: str = "perseus-vault",
+        db_path: str = "~/.perseus-vault/data/crew.db",
         timeout: float = 30.0,
         encryption_key: Optional[str] = None,
     ):
@@ -72,7 +72,7 @@ class MimirMemoryTool(BaseTool):
     # ── session management ──────────────────────────────────────────
 
     def _ensure_session(self):
-        """Spawn a persistent mimir process if one isn't already running."""
+        """Spawn a persistent perseus-vault process if one isn't already running."""
         if self._proc is not None and self._proc.poll() is None:
             return  # already alive
 
@@ -98,7 +98,7 @@ class MimirMemoryTool(BaseTool):
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "crewai-mimir", "version": "1.0.0"},
+                "clientInfo": {"name": "crewai-perseus-vault", "version": "1.0.0"},
             },
         })
         try:
@@ -106,7 +106,7 @@ class MimirMemoryTool(BaseTool):
             self._proc.stdin.flush()
         except (BrokenPipeError, OSError):
             self._proc = None
-            raise RuntimeError("Failed to initialize mimir process")
+            raise RuntimeError("Failed to initialize perseus-vault process")
 
         # Read the initialize response (ignore — just consume it)
         self._read_response(init_id)
@@ -144,7 +144,7 @@ class MimirMemoryTool(BaseTool):
         return None
 
     def _close_session(self):
-        """Shut down the persistent mimir process."""
+        """Shut down the persistent perseus-vault process."""
         if self._proc is None:
             return
         try:
@@ -165,9 +165,9 @@ class MimirMemoryTool(BaseTool):
 
     @staticmethod
     def _unwrap_result(result: dict) -> dict:
-        """Unwrap an MCP ``tools/call`` result into Mimir's payload dict.
+        """Unwrap an MCP ``tools/call`` result into Perseus Vault's payload dict.
 
-        Mimir returns the standard MCP envelope::
+        Perseus Vault returns the standard MCP envelope::
 
             {"content": [{"type": "text", "text": "<json>"}],
              "structuredContent": {...parsed json...}}
@@ -190,8 +190,8 @@ class MimirMemoryTool(BaseTool):
                 return parsed
         return {}
 
-    def _call_mimir(self, method: str, params: dict) -> dict:
-        """Call a Mimir MCP tool via the persistent stdio session."""
+    def _call_perseus_vault(self, method: str, params: dict) -> dict:
+        """Call a Perseus Vault MCP tool via the persistent stdio session."""
         with self._lock:
             try:
                 self._ensure_session()
@@ -211,13 +211,13 @@ class MimirMemoryTool(BaseTool):
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._proc = None
-                return {"error": "mimir process died — call re-spawns"}
+                return {"error": "perseus-vault process died — call re-spawns"}
 
             response = self._read_response(req_id)
             if response is None:
                 # Process likely died — reset so next call re-spawns
                 self._close_session()
-                return {"error": "no response from mimir (process may have exited)"}
+                return {"error": "no response from perseus-vault (process may have exited)"}
             if response.get("error"):
                 return {"error": response["error"]}
             return self._unwrap_result(response.get("result", {}))
@@ -250,7 +250,7 @@ class MimirMemoryTool(BaseTool):
         entity_type: str = "fact",
     ) -> str:
         """Store a fact, decision, or piece of knowledge."""
-        result = self._call_mimir("mimir_remember", {
+        result = self._call_perseus_vault("perseus_vault_remember", {
             "category": category,
             "key": key or f"auto-{int(time.time())}",
             "body_json": json.dumps({"content": content}),
@@ -271,7 +271,7 @@ class MimirMemoryTool(BaseTool):
         if category:
             params["category"] = category
 
-        result = self._call_mimir("mimir_recall", params)
+        result = self._call_perseus_vault("perseus_vault_recall", params)
         items = result.get("items", [])
 
         if not items:
@@ -294,7 +294,7 @@ class MimirMemoryTool(BaseTool):
         context: str = "",
     ) -> str:
         """Record a significant event in the journal."""
-        result = self._call_mimir("mimir_journal", {
+        result = self._call_perseus_vault("perseus_vault_journal", {
             "event_type": event_type,
             "category": "crewai",
             "key": f"event-{int(time.time())}",
@@ -306,7 +306,7 @@ class MimirMemoryTool(BaseTool):
 
     def _context(self) -> str:
         """Get a summary of recent memories for session context."""
-        result = self._call_mimir("mimir_context", {})
+        result = self._call_perseus_vault("perseus_vault_context", {})
         if "error" in result:
             return f"Failed to get context: {result['error']}"
         context_text = result.get("context", "")

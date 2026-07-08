@@ -1,8 +1,8 @@
-"""Tests for the CrewAI MimirMemoryTool.
+"""Tests for the CrewAI PerseusVaultMemoryTool.
 
 CrewAI (and its heavy dependency tree) need not be installed to exercise the
-Mimir wiring: we stub ``crewai.tools.BaseTool`` with a minimal base class, then
-drive the tool against Mimir's real MCP JSON-RPC envelope via a fake subprocess.
+Perseus Vault wiring: we stub ``crewai.tools.BaseTool`` with a minimal base class, then
+drive the tool against Perseus Vault's real MCP JSON-RPC envelope via a fake subprocess.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ import pytest
 
 
 @pytest.fixture(scope="module")
-def MimirMemoryTool():
-    """Import MimirMemoryTool with a stubbed ``crewai.tools.BaseTool``."""
+def PerseusVaultMemoryTool():
+    """Import PerseusVaultMemoryTool with a stubbed ``crewai.tools.BaseTool``."""
     if "crewai" not in sys.modules:
         crewai = types.ModuleType("crewai")
         tools = types.ModuleType("crewai.tools")
@@ -33,7 +33,7 @@ def MimirMemoryTool():
         sys.modules["crewai"] = crewai
         sys.modules["crewai.tools"] = tools
 
-    from mimir_crewai import MimirMemoryTool as tool_cls
+    from perseus_vault_crewai import PerseusVaultMemoryTool as tool_cls
 
     return tool_cls
 
@@ -118,7 +118,7 @@ def _fake_popen(routes):
     return FakePopen
 
 
-def test_remember_sends_type(monkeypatch, MimirMemoryTool):
+def test_remember_sends_type(monkeypatch, PerseusVaultMemoryTool):
     captured = {}
 
     def remember(args):
@@ -126,9 +126,9 @@ def test_remember_sends_type(monkeypatch, MimirMemoryTool):
         return {"id": "mem-1", "status": "ok"}
 
     monkeypatch.setattr(
-        "mimir_crewai.subprocess.Popen", _fake_popen({"mimir_remember": remember})
+        "perseus_vault_crewai.subprocess.Popen", _fake_popen({"perseus_vault_remember": remember})
     )
-    tool = MimirMemoryTool()
+    tool = PerseusVaultMemoryTool()
     out = tool._remember(category="crewai", key="k1", content="hello world")
 
     assert captured.get("type") == "fact"  # regression: was the dropped "entity_type"
@@ -137,7 +137,7 @@ def test_remember_sends_type(monkeypatch, MimirMemoryTool):
     assert "Remembered" in out
 
 
-def test_recall_parses_structured_items(monkeypatch, MimirMemoryTool):
+def test_recall_parses_structured_items(monkeypatch, PerseusVaultMemoryTool):
     def recall(args):
         return {
             "items": [
@@ -151,9 +151,9 @@ def test_recall_parses_structured_items(monkeypatch, MimirMemoryTool):
         }
 
     monkeypatch.setattr(
-        "mimir_crewai.subprocess.Popen", _fake_popen({"mimir_recall": recall})
+        "perseus_vault_crewai.subprocess.Popen", _fake_popen({"perseus_vault_recall": recall})
     )
-    tool = MimirMemoryTool()
+    tool = PerseusVaultMemoryTool()
     out = tool._recall(query="answer")
 
     # Before the envelope-unwrap fix this returned "No memories found".
@@ -161,7 +161,7 @@ def test_recall_parses_structured_items(monkeypatch, MimirMemoryTool):
     assert "the answer is 42" in out
 
 
-def test_unwrap_handles_text_only_envelope(MimirMemoryTool):
-    assert MimirMemoryTool._unwrap_result(
+def test_unwrap_handles_text_only_envelope(PerseusVaultMemoryTool):
+    assert PerseusVaultMemoryTool._unwrap_result(
         {"content": [{"type": "text", "text": json.dumps({"items": [1, 2]})}]}
     ) == {"items": [1, 2]}

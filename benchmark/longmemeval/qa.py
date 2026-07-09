@@ -25,9 +25,13 @@ API key: env OPENAI_API_KEY, else the file ~/.openai_key (contents, whitespace
 stripped). The key is NEVER printed or logged. OPENAI_BASE_URL overrides the
 endpoint (OpenAI-compatible servers work).
 
-Cost control: a real run prints an upfront cost estimate and, above
---limit 50, refuses to proceed without --yes. This harness is opt-in and is
-NOT part of any CI gate.
+Cost control: a real run prints an upfront cost estimate + ETA and, above
+--limit 50, refuses to proceed without --yes. Rate limiting: --tpm (default
+25000, safely under OpenAI Tier-1 gpt-4o's 30k tokens/min) paces answerer AND
+judge calls against a rolling 60s token budget, and 429s honor Retry-After.
+Questions whose answerer still fails after all retries are recorded as
+answer_error and EXCLUDED from the accuracy denominator — throttling can slow
+a run but can never deflate the number. Opt-in; NOT part of any CI gate.
 
 Usage:
   # Plumbing smoke test, no key and no network needed (stubbed answerer+judge):
@@ -56,6 +60,7 @@ import json
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import time
@@ -148,14 +153,78 @@ def get_api_key():
     )
 
 
-def call_llm(base_url, api_key, model, prompt, max_retries=6):
-    """One chat completion at temperature 0, with backoff on 429/5xx/transient errors."""
+class TokenBudget:
+    """Rolling 60s token budget so a low-tier key never trips the TPM limit.
+
+    acquire(est) blocks until `est` tokens fit in the current 60s window, then
+    reserves them; settle(handle, actual) corrects the reservation to the real
+    usage the API reported (or 0 for a rejected request). Thread-free by design
+    (the harness is sequential)."""
+
+    def __init__(self, tpm):
+        self.tpm = tpm
+        self.events = []  # [t_reserved, tokens]
+
+    def _prune(self, now):
+        self.events = [e for e in self.events if now - e[0] < 60.0]
+
+    def acquire(self, est):
+        if not self.tpm:
+            return None
+        need = min(est, self.tpm)  # an oversized single request waits for an empty window
+        while True:
+            now = time.time()
+            self._prune(now)
+            used = sum(e[1] for e in self.events)
+            if used + need <= self.tpm:
+                break
+            wait = (self.events[0][0] + 60.0 - now) if self.events else 1.0
+            time.sleep(max(0.25, min(wait, 60.0)))
+        ev = [time.time(), est]
+        self.events.append(ev)
+        return ev
+
+    def settle(self, ev, actual_tokens):
+        if ev is not None and actual_tokens is not None:
+            ev[1] = actual_tokens
+
+
+def _retry_delay(err, attempt):
+    """Delay before a retry: honor Retry-After / the 429 body's 'try again in Xs'
+    when present, else exponential backoff."""
+    if isinstance(err, urllib.error.HTTPError):
+        ra = (err.headers.get("Retry-After") or "").strip() if err.headers else ""
+        if ra:
+            try:
+                return min(120.0, float(ra)) + random.uniform(0, 1)
+            except ValueError:
+                pass  # HTTP-date form; fall through
+        try:
+            body = getattr(err, "_body_cache", None)
+            if body is None:
+                body = err.read().decode("utf-8", "replace")
+                err._body_cache = body
+            m = re.search(r"try again in ([0-9.]+)\s*(ms|s)", body, re.IGNORECASE)
+            if m:
+                secs = float(m.group(1)) / (1000.0 if m.group(2).lower() == "ms" else 1.0)
+                return min(120.0, secs) + random.uniform(0.5, 1.5)
+        except Exception:
+            pass
+    return min(60.0, 2 ** attempt) + random.uniform(0, 1)
+
+
+def call_llm(base_url, api_key, model, prompt, budget=None, max_retries=12):
+    """One chat completion at temperature 0. Token-paced via `budget`, honors
+    Retry-After on 429, exponential backoff otherwise. Raises only after
+    max_retries — callers record that as answer_error, never as a wrong answer."""
     body = json.dumps({
         "model": model, "temperature": 0,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
     url = base_url.rstrip("/") + "/chat/completions"
+    est = est_tokens(prompt) + 300  # request + response headroom
     for attempt in range(max_retries):
+        ev = budget.acquire(est) if budget else None
         try:
             req = urllib.request.Request(url, data=body, headers={
                 "Authorization": f"Bearer {api_key}",
@@ -163,12 +232,17 @@ def call_llm(base_url, api_key, model, prompt, max_retries=6):
             })
             with urllib.request.urlopen(req, timeout=120) as resp:
                 out = json.loads(resp.read())
+            if budget:
+                usage = out.get("usage") or {}
+                budget.settle(ev, usage.get("total_tokens") or est)
             return out["choices"][0]["message"]["content"].strip()
         except urllib.error.HTTPError as e:
             if e.code == 429 or e.code >= 500:
+                if budget:
+                    budget.settle(ev, 0)  # rejected requests don't consume TPM
                 if attempt == max_retries - 1:
                     raise
-                delay = min(60, 2 ** attempt) + random.uniform(0, 1)
+                delay = _retry_delay(e, attempt)
                 print(f"  ! HTTP {e.code}, retrying in {delay:.0f}s "
                       f"({attempt + 1}/{max_retries})", file=sys.stderr)
                 time.sleep(delay)
@@ -176,9 +250,11 @@ def call_llm(base_url, api_key, model, prompt, max_retries=6):
                 # 4xx other than 429: not transient. Do not echo headers (key safety).
                 raise RuntimeError(f"LLM call failed: HTTP {e.code} {e.reason}") from None
         except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if budget:
+                budget.settle(ev, 0)
             if attempt == max_retries - 1:
                 raise
-            delay = min(60, 2 ** attempt) + random.uniform(0, 1)
+            delay = min(60.0, 2 ** attempt) + random.uniform(0, 1)
             print(f"  ! transient error ({type(e).__name__}), retrying in {delay:.0f}s "
                   f"({attempt + 1}/{max_retries})", file=sys.stderr)
             time.sleep(delay)
@@ -264,17 +340,19 @@ def estimate_cost(data, systems, k, model, judge):
     answer_out, judge_in_fixed, judge_out = 150, 250, 5
     a_in, a_out = price_for(model)
     j_in, j_out = price_for(judge)
-    total, lines = 0.0, []
+    total, total_toks, lines = 0.0, 0, []
     for system in systems:
         ans_in_toks = n * (ctx_per_system[system] + 120)
+        sys_toks = ans_in_toks + n * (answer_out + judge_in_fixed + answer_out + judge_out)
         cost = (ans_in_toks / 1e6 * a_in) + (n * answer_out / 1e6 * a_out) \
              + (n * (judge_in_fixed + answer_out) / 1e6 * j_in) + (n * judge_out / 1e6 * j_out)
         total += cost
+        total_toks += sys_toks
         lines.append(f"  {system:<13}~{ans_in_toks / 1e6:5.1f}M answerer input tokens"
                      f"  -> est ${cost:,.2f}")
     unknown = [m for m in {model, judge} if m not in PRICING]
     note = f"  (unknown pricing for {', '.join(unknown)}; assumed gpt-4o rates)" if unknown else ""
-    return total, "\n".join(lines) + (f"\n{note}" if note else "")
+    return total, total_toks, "\n".join(lines) + (f"\n{note}" if note else "")
 
 
 def git_commit():
@@ -313,6 +391,18 @@ def main():
                     help="Build prompts + count tokens only; no LLM, no judge, no report")
     ap.add_argument("--yes", action="store_true",
                     help="Accept the printed cost estimate (required for real runs above 50 instances)")
+    ap.add_argument("--tpm", type=int, default=25000,
+                    help="Token-per-minute budget for API pacing (default 25000, safely under "
+                         "OpenAI Tier-1 gpt-4o's 30k TPM; 0 disables pacing). Answerer and "
+                         "judge calls share the budget.")
+    ap.add_argument("--resume", action="store_true",
+                    help="#518: resume from the progress journal — already-judged questions are "
+                         "skipped (their verdicts reload from disk); errored questions are "
+                         "retried. The journal must match this run's config exactly.")
+    ap.add_argument("--journal", default=None,
+                    help="Progress journal path (default: <outdir>/qa_progress-<split>-<model>.jsonl). "
+                         "Appended after EVERY judged question, so a killed run loses at most "
+                         "the question in flight.")
     ap.add_argument("--out", default=str(HERE / "qa_report.json"))
     ap.add_argument("--outdir", default=str(HERE), help="Where hypotheses-*.jsonl files go")
     args = ap.parse_args()
@@ -332,11 +422,16 @@ def main():
     api_key = get_api_key() if live else ""
 
     if not args.dry_run:
-        cost, detail = estimate_cost(data, args.systems, args.k, args.model, args.judge)
+        cost, toks, detail = estimate_cost(data, args.systems, args.k, args.model, args.judge)
         print(f"Estimated cost for {len(data)} instances x {len(args.systems)} system(s) "
               f"(answerer={args.model}, judge={args.judge}):\n{detail}\n"
               f"  total     est ${cost:,.2f}"
               + ("   [mock run: $0 actually spent]" if args.mock_llm else ""))
+        if live and args.tpm:
+            eta_min = toks / args.tpm
+            eta = f"{eta_min / 60:.1f}h" if eta_min >= 90 else f"{eta_min:.0f} min"
+            print(f"  pacing    ~{toks / 1e6:.1f}M est tokens at --tpm {args.tpm:,}"
+                  f"  -> ETA ~{eta} (rate-limit bound, not compute bound)")
         if live and len(data) > 50 and not args.yes:
             sys.exit("\nThis is a paid full run. Re-run with --yes to accept the estimate "
                      "(or use --limit 10 for a cheap smoke run, --mock-llm for free plumbing).")
@@ -356,19 +451,86 @@ def main():
     tok = {s: 0 for s in args.systems}
     nsess = {s: 0 for s in args.systems}
     hyps = {s: [] for s in args.systems}
-    verdicts = []  # {question_id, question_type, system, correct, judge_raw}
+    verdicts = []  # {question_id, question_type, system, correct, error, judge_raw}
+    budget = TokenBudget(args.tpm) if (live and args.tpm) else None
     t0 = time.time()
+
+    # ── #518: crash-safe progress journal + resume ─────────────────────────
+    # One JSON line per judged (question, system), appended and flushed as it
+    # happens — a killed run (crash, reboot, quota exhaustion, parent-process
+    # teardown) loses at most the question in flight, never the run. The first
+    # line pins the run config; --resume refuses a mismatched journal rather
+    # than silently blending two configurations. The signed report is still
+    # produced ONLY at completion over the full verdict set: a partial journal
+    # is never signed and never quotable.
+    model_tag = ("mock" if args.mock_llm else args.model).replace("/", "_")
+    journal_path = Path(args.journal) if args.journal else \
+        Path(args.outdir) / f"qa_progress-{args.split}-{model_tag}.jsonl"
+    run_config = {"split": args.split, "n": len(data),
+                  "systems": sorted(args.systems),
+                  "model": "mock" if args.mock_llm else args.model,
+                  "judge": "mock" if args.mock_llm else args.judge,
+                  "k": args.k}
+    done = {}
+    journal = None
+    if not args.dry_run:
+        resume_ok = False
+        if args.resume and journal_path.exists():
+            lines = [json.loads(ln) for ln in
+                     journal_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            if not lines or "_config" not in lines[0]:
+                sys.exit(f"error: --resume: {journal_path} has no config header — "
+                         "not a progress journal (delete it or pass --journal).")
+            if lines[0]["_config"] != run_config:
+                sys.exit("error: --resume config mismatch:\n"
+                         f"  journal: {lines[0]['_config']}\n  current: {run_config}\n"
+                         "Delete the journal (or pass --journal) to start fresh.")
+            for rec in lines[1:]:
+                # Completed verdicts reload; errored questions retry.
+                if rec.get("error") is None:
+                    done[(rec["question_id"], rec["system"])] = rec
+            resume_ok = True
+            print(f"  resume: {len(done)} judged answers reloaded from "
+                  f"{journal_path.name}; errored/unfinished questions will run.")
+        journal = open(journal_path, "a" if resume_ok else "w", encoding="utf-8")
+        if not resume_ok:
+            journal.write(json.dumps({"_config": run_config}) + "\n")
+            journal.flush()
+        # Seed the accumulators from the reloaded verdicts so the final report
+        # covers the WHOLE run, not just this process's share.
+        for rec in done.values():
+            tok[rec["system"]] += rec.get("tokens_est", 0)
+            nsess[rec["system"]] += rec.get("sessions", 0)
+            hyps[rec["system"]].append({"question_id": rec["question_id"],
+                                        "hypothesis": rec.get("hypothesis", "")})
+            verdicts.append({k: rec.get(k) for k in
+                             ("question_id", "question_type", "system",
+                              "abstention", "correct", "error", "judge_raw")})
+
+    def record(rec, hypothesis, tokens_est, sessions):
+        """Append a verdict to memory AND the crash-safe journal."""
+        verdicts.append(rec)
+        if journal:
+            journal.write(json.dumps({**rec, "hypothesis": hypothesis,
+                                      "tokens_est": tokens_est,
+                                      "sessions": sessions}) + "\n")
+            journal.flush()
 
     for idx, inst in enumerate(data):
         qid = inst["question_id"]
         qtype = inst.get("question_type", "unknown")
         is_abs = qid.endswith("_abs")
+        # #518: fully-judged instances skip even the (expensive) re-ingest.
+        if not args.dry_run and all((qid, s) in done for s in args.systems):
+            continue
         srv = None
         if need_mimir:
             wipe()
             srv = MimirServer(binary, db)
         try:
             for system in args.systems:
+                if (qid, system) in done:
+                    continue
                 ctx, chosen = build_context(system, inst, srv, qid, args.k)
                 prompt = ANSWER_PROMPT.format(context=ctx, question=inst["question"],
                                               question_date=inst.get("question_date", "unknown"))
@@ -378,14 +540,24 @@ def main():
                     hyps[system].append({"question_id": qid, "hypothesis": ""})
                     continue
 
+                q_tokens = est_tokens(prompt)
                 if args.mock_llm:
                     ans = mock_answer(inst, idx)
                 else:
                     try:
-                        ans = call_llm(base_url, api_key, args.model, prompt)
+                        ans = call_llm(base_url, api_key, args.model, prompt, budget)
                     except Exception as e:
-                        ans = ""
-                        print(f"  ! answerer error on {qid}/{system}: {e}", file=sys.stderr)
+                        # A rate-limited/failed question must NEVER deflate accuracy:
+                        # record it as answer_error and exclude it from the denominator.
+                        # (--resume retries it: errored records don't enter `done`.)
+                        print(f"  !! ANSWER_ERROR on {qid}/{system} (excluded from accuracy): {e}",
+                              file=sys.stderr)
+                        hyps[system].append({"question_id": qid, "hypothesis": ""})
+                        record({"question_id": qid, "question_type": qtype,
+                                "system": system, "abstention": is_abs,
+                                "correct": None, "error": "answer_error",
+                                "judge_raw": None}, "", q_tokens, len(chosen))
+                        continue
                 hyps[system].append({"question_id": qid, "hypothesis": ans})
 
                 jt = JUDGE_PROMPT_ABSTAIN if is_abs else JUDGE_PROMPT
@@ -394,27 +566,40 @@ def main():
                     jraw = mock_judge(inst, ans)
                 else:
                     try:
-                        jraw = call_llm(base_url, api_key, args.judge, jp)
+                        jraw = call_llm(base_url, api_key, args.judge, jp, budget)
                     except Exception as e:
-                        jraw = "error"
-                        print(f"  ! judge error on {qid}/{system}: {e}", file=sys.stderr)
+                        print(f"  !! JUDGE_ERROR on {qid}/{system} (excluded from accuracy): {e}",
+                              file=sys.stderr)
+                        record({"question_id": qid, "question_type": qtype,
+                                "system": system, "abstention": is_abs,
+                                "correct": None, "error": "judge_error",
+                                "judge_raw": None}, ans, q_tokens, len(chosen))
+                        continue
                 correct = jraw.strip().lower().startswith("yes")
-                verdicts.append({"question_id": qid, "question_type": qtype, "system": system,
-                                 "abstention": is_abs, "correct": correct,
-                                 "judge_raw": jraw.strip()[:40]})
+                record({"question_id": qid, "question_type": qtype, "system": system,
+                        "abstention": is_abs, "correct": correct, "error": None,
+                        "judge_raw": jraw.strip()[:40]}, ans, q_tokens, len(chosen))
         finally:
             if srv:
                 srv.close()
-        if (idx + 1) % 25 == 0 or (idx + 1) == len(data):
-            print(f"  {idx + 1}/{len(data)}  ({time.time() - t0:.0f}s)", flush=True)
+        # #518: per-question progress with a running graded accuracy, so a
+        # backgrounded run is observable from its output file.
+        graded_so_far = [v for v in verdicts if v.get("error") is None]
+        acc_so_far = (sum(1 for v in graded_so_far if v["correct"])
+                      / max(1, len(graded_so_far)) * 100)
+        print(f"  {idx + 1}/{len(data)}  graded={len(graded_so_far)} "
+              f"acc={acc_so_far:.1f}%  ({time.time() - t0:.0f}s)", flush=True)
     if need_mimir:
         wipe()
+    if journal:
+        journal.close()
 
     n = len(data)
     # Hypotheses files in LongMemEval's official format, so their evaluate_qa.py
     # can independently cross-check our judge. Skipped in dry-run (empty).
+    # (On a resumed run, reloaded answers come first — evaluate_qa.py keys on
+    # question_id, so order is immaterial.)
     if not args.dry_run:
-        model_tag = ("mock" if args.mock_llm else args.model).replace("/", "_")
         for system in args.systems:
             out = Path(args.outdir) / f"hypotheses-{system}-{model_tag}.jsonl"
             out.write_text("\n".join(json.dumps(h) for h in hyps[system]) + "\n", encoding="utf-8")
@@ -438,23 +623,37 @@ def main():
     systems_report = {}
     for system in args.systems:
         vs = [v for v in verdicts if v["system"] == system]
+        # Errored questions (rate limit exhausted, judge failure) are EXCLUDED
+        # from the accuracy denominator — a throttled run must not deflate the
+        # published number. They are counted prominently instead.
+        graded = [v for v in vs if v["error"] is None]
+        answer_errors = sum(1 for v in vs if v["error"] == "answer_error")
+        judge_errors = sum(1 for v in vs if v["error"] == "judge_error")
         by_type = {}
-        for v in vs:
+        for v in graded:
             bt = by_type.setdefault(v["question_type"], {"n": 0, "correct": 0})
             bt["n"] += 1
             bt["correct"] += int(v["correct"])
         for bt in by_type.values():
             bt["accuracy"] = round(bt["correct"] / bt["n"], 4)
-        abst = [v for v in vs if v["abstention"]]
+        abst = [v for v in graded if v["abstention"]]
         systems_report[system] = {
-            "n": len(vs),
-            "accuracy": round(sum(v["correct"] for v in vs) / max(1, len(vs)), 4),
+            "n_attempted": len(vs),
+            "n_graded": len(graded),
+            "answer_errors": answer_errors,
+            "judge_errors": judge_errors,
+            "accuracy": round(sum(v["correct"] for v in graded) / max(1, len(graded)), 4),
             "by_question_type": by_type,
             "abstention": {"n": len(abst),
                            "accuracy": round(sum(v["correct"] for v in abst) / len(abst), 4) if abst else None},
             "avg_context_tokens_est": round(tok[system] / n),
             "avg_sessions_in_context": round(nsess[system] / n, 1),
         }
+        if answer_errors or judge_errors:
+            print(f"  !! {system}: {answer_errors} answer_error(s) + {judge_errors} judge_error(s) "
+                  f"EXCLUDED from the accuracy denominator ({len(graded)}/{len(vs)} graded). "
+                  "Re-run those questions (lower --tpm or higher tier) before publishing.",
+                  file=sys.stderr)
 
     # Signature over the verdict set (same convention as run.py's signed report).
     sig_payload = json.dumps({
@@ -486,9 +685,11 @@ def main():
         "hardware": {"machine": platform.machine(), "processor": platform.processor(),
                      "cpu_count": os.cpu_count()},
         "elapsed_secs": round(time.time() - t0, 1),
+        "tpm_budget": args.tpm if live else None,
         "signature_sha256": signature,
         "per_question": [{"question_id": v["question_id"], "question_type": v["question_type"],
-                          "system": v["system"], "correct": v["correct"]} for v in verdicts],
+                          "system": v["system"], "correct": v["correct"],
+                          "error": v["error"]} for v in verdicts],
     }
     Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
@@ -497,7 +698,10 @@ def main():
              else f"  answerer={args.model} judge={args.judge}"))
     for system in args.systems:
         sr = systems_report[system]
-        print(f"\n  {system}: accuracy {sr['accuracy'] * 100:.1f}%  ({sr['n']} questions)")
+        err_note = (f", {sr['answer_errors'] + sr['judge_errors']} errored+excluded"
+                    if (sr["answer_errors"] or sr["judge_errors"]) else "")
+        print(f"\n  {system}: accuracy {sr['accuracy'] * 100:.1f}%  "
+              f"({sr['n_graded']} graded of {sr['n_attempted']} attempted{err_note})")
         for qt, bt in sorted(sr["by_question_type"].items()):
             print(f"    {qt:<28}{bt['correct']:>4}/{bt['n']:<4}  {bt['accuracy'] * 100:5.1f}%")
         if sr["abstention"]["n"]:

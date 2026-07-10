@@ -6,16 +6,57 @@ use std::sync::OnceLock;
 use crate::db::Database;
 use crate::tools;
 
-/// Returns `true` if this process has been reparented to init (ppid == 1),
-/// which is the definitive Linux indicator that the spawning parent has died.
+/// The parent PID observed once at process start, before any reparenting can
+/// occur. `is_orphaned_by_ppid()` compares the live ppid against this baseline
+/// so we detect *reparenting* (parent died → we were re-adopted) rather than
+/// the mere fact that our ppid is 1.
 ///
-/// Exposed as `pub` so the ppid==1 orphan case can be unit-tested without
-/// needing to actually kill a parent process.
+/// This distinction matters in containers: when the vault is spawned directly
+/// by a PID-1 entrypoint (e.g. a Python `demo_server_local.py` running as the
+/// container's init, or any `docker run <binary>` where the binary's launcher
+/// is PID 1), a perfectly healthy child legitimately has `getppid() == 1` from
+/// birth. The original `getppid() == 1` guard (#547) false-positived on exactly
+/// that topology and self-terminated a live server on its first request. See
+/// the demo-container regression: parent is PID 1, so every start tripped the
+/// orphan guard and crash-looped.
+static INITIAL_PPID: OnceLock<i32> = OnceLock::new();
+
+/// Record the current parent PID as the baseline. Call once, as early as
+/// possible in `run_server`, before entering the request loop. Idempotent:
+/// only the first call sets the baseline.
+pub fn record_initial_ppid() {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = INITIAL_PPID.set(unsafe { libc::getppid() });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = INITIAL_PPID.set(0);
+    }
+}
+
+/// Returns `true` if this process has been reparented since start, which is the
+/// definitive indicator that the spawning parent has died.
+///
+/// Orphaning is detected as: the live ppid differs from the baseline captured
+/// at start AND the live ppid is now 1 (reparented to init). A process that was
+/// *born* with ppid == 1 (its launcher is the container's PID-1 init) is NOT an
+/// orphan — its baseline is 1 and stays 1, so this correctly returns `false`.
+///
+/// Exposed as `pub` so the orphan case can be unit-tested without needing to
+/// actually kill a parent process.
 pub fn is_orphaned_by_ppid() -> bool {
     // Safety: getppid() is always safe — no undefined behaviour, no allocation.
     #[cfg(target_os = "linux")]
     {
-        unsafe { libc::getppid() == 1 }
+        let current = unsafe { libc::getppid() };
+        // Baseline should have been recorded at startup; if it wasn't (defensive),
+        // fall back to comparing against the current value so we never false-fire.
+        let baseline = *INITIAL_PPID.get_or_init(|| current);
+        // Orphaned only if we were reparented to init: born under a real parent
+        // (baseline != 1) and now adopted by init (current == 1). A process born
+        // directly under PID 1 has baseline == 1 and is never treated as orphaned.
+        current == 1 && baseline != 1
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -89,6 +130,12 @@ pub fn parse_idle_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
 /// to the web dashboard / gRPC surfaces instead of each opening a second
 /// `Database` (a second 16-conn pool) on the same file.
 pub fn run_server(db: std::sync::Arc<Database>) {
+    // Capture the baseline parent PID immediately, before anything can reparent
+    // us. is_orphaned_by_ppid() compares against this so a process legitimately
+    // born under a PID-1 container entrypoint is not mistaken for an orphan (#547
+    // follow-up: fixes the demo-container crash loop).
+    record_initial_ppid();
+
     let mut stdout = std::io::stdout();
     let state = MCPState::new();
 
@@ -130,10 +177,12 @@ pub fn run_server(db: std::sync::Arc<Database>) {
     // held by a still-live sibling keeps recv_timeout() marginally fed so
     // the idle timer never elapses, yet the spawning parent is already dead.
     //
-    // After setting the signal we re-check getppid() immediately: if the
-    // parent died in the window between fork() and prctl() we exit now
+    // After setting the signal we re-check is_orphaned_by_ppid() immediately:
+    // if the parent died in the window between fork() and prctl() we exit now
     // rather than blocking forever (the signal delivery already happened
-    // before the prctl so we would never receive it).
+    // before the prctl so we would never receive it). This compares the live
+    // ppid against the baseline captured at start, so a server born directly
+    // under a PID-1 container entrypoint is NOT treated as orphaned.
     #[cfg(target_os = "linux")]
     {
         unsafe {
@@ -4667,20 +4716,56 @@ mod tests {
         );
     }
 
-    /// Verify that `is_orphaned_by_ppid` returns `true` when ppid IS 1.
+    /// Verify that `is_orphaned_by_ppid` distinguishes a reparented orphan from
+    /// a process legitimately born under a PID-1 init.
     ///
-    /// We can't kill the real parent in a unit test, so we model the logic
-    /// directly: on Linux `getppid() == 1` is the criterion.  This test
-    /// documents the contract and guards against future refactors that break it.
+    /// We can't kill the real parent in a unit test, so we model the decision
+    /// directly against the documented contract:
+    ///   orphaned  <=>  current_ppid == 1  AND  baseline_ppid != 1
+    ///
+    /// This is the exact logic that fixes the demo-container crash loop, where a
+    /// server born under a PID-1 entrypoint (baseline == 1) was falsely reaped by
+    /// the old `getppid() == 1` guard. Full end-to-end orphan detection (spawn a
+    /// child, kill the parent, observe reparenting) is left to manual/integration
+    /// verification since a unit test cannot reparent itself.
     #[test]
     fn is_orphaned_by_ppid_contract() {
-        // The function under test calls libc::getppid() and compares to 1.
-        // We verify the inverse (current process is definitely not orphaned)
-        // and document that a process with ppid==1 would return true.
-        // Full end-to-end orphan detection is validated by the integration
-        // test in tests/orphan_reap.rs (spawns a child and kills the parent).
-        let orphaned = super::is_orphaned_by_ppid();
-        // In CI and local dev the test runner's parent is never init.
-        assert!(!orphaned, "ppid should not be 1 in a normal test environment");
+        // Pure decision function mirroring is_orphaned_by_ppid's Linux branch.
+        fn decide(current_ppid: i32, baseline_ppid: i32) -> bool {
+            current_ppid == 1 && baseline_ppid != 1
+        }
+
+        // Born under a real parent, later reparented to init => orphaned.
+        assert!(decide(1, 4242), "reparented-to-init must be treated as orphaned");
+
+        // Born directly under PID 1 (container entrypoint) and still there =>
+        // NOT an orphan. This is the demo-container regression case.
+        assert!(
+            !decide(1, 1),
+            "process born under PID-1 init must NOT be treated as orphaned"
+        );
+
+        // Normal case: real, unchanged parent => not orphaned.
+        assert!(!decide(4242, 4242), "live parent must not be treated as orphaned");
+
+        // Sanity: the live function never fires in a normal test environment
+        // (the test runner's parent is never init).
+        assert!(
+            !super::is_orphaned_by_ppid(),
+            "ppid should not be 1 in a normal test environment"
+        );
+    }
+
+    /// The baseline recorder must be idempotent and safe to call, and after
+    /// recording, a normal test process (real parent, not init) must not be
+    /// considered orphaned.
+    #[test]
+    fn record_initial_ppid_is_idempotent_and_safe() {
+        super::record_initial_ppid();
+        super::record_initial_ppid(); // second call must not panic
+        assert!(
+            !super::is_orphaned_by_ppid(),
+            "after recording baseline, a process with a live parent is not orphaned"
+        );
     }
 }

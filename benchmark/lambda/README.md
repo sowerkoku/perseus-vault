@@ -47,6 +47,21 @@ its real OSS engine (Graphiti on Neo4j), whose 0.20 reflects lossy *local-model*
 extraction, not Zep Cloud (frontier models). See `results/competitors.json` and
 `competitors_bench.py`.
 
+### 1d. Recall by mode — 1,000,000 distinct entities (2×H100 fleet)
+| recall@k | keyword (fts5) | dense | hybrid |
+|---|---|---|---|
+| @1 | 0.001 | 0.262 | **0.634** |
+| @5 | 0.001 | 0.458 | **1.000** |
+| @10 | 0.003 | 0.532 | **1.000** |
+
+At **1M** entities **hybrid holds recall@5 = 1.000 while keyword collapses to 0.001 — a
+~1000× gap** (keyword degrades further at 10× scale). Corpus: 995,562 persisted of 1,000,000
+seeded via `mimir_remember` (0.44% dedup gap — distinctness holds). Fleet-embedded at
+196.8 emb/s across 2 pinned H100 daemons (see §2). `uniform ≈ warm_set` recall confirms
+the `dense_search` 50k brute-force scan cap acts as a uniform sampler across clusters
+(random `mem-<uuid>` ids: 9,937/10,000 clusters reachable), not a first-N wall; standalone
+dense@5=0.458 under the cap motivates an ANN/HNSW index. See `results/scale_1m_distinct.json`.
+
 ### 2. Multi-GPU throughput — 8×H100 fleet
 Peak **651 embeddings/sec** at concurrency 64 — **22.8× the single-thread baseline**
 and **~4.7× a single Ollama daemon's saturation ceiling (~137 eps)**. Achieved with
@@ -69,6 +84,7 @@ for grounded recall — reinforcing the edge/offline story.
 | `serve.sh` | Single-daemon inference endpoint (LLM + embeddings) |
 | `serve_fleet.sh` | **N Ollama daemons pinned one-per-GPU + nginx LB** (multi-GPU scale-out) |
 | `scale_bench.py` | Seed → embed → recall@k (fts5/dense/hybrid) at configurable corpus size |
+| `scale_bench_1m.py` | 1M-scale variant of `scale_bench.py`: client-side **fleet embedding** (direct DB write, binary-identical `embedding`+`emb_sig`), query sampling, and uniform + warm-set recall |
 | `parallel_embed_fleet.py` | Aggregate embedding throughput vs concurrency across the fleet |
 | `quality_lift.py` | mimir_ask accuracy/latency across chat models (14B vs 72B) |
 | `mem0_bench.py` | Competitive: same recall task against Mem0, same box + Ollama |
@@ -79,6 +95,7 @@ for grounded recall — reinforcing the edge/offline story.
 | `competitors_up.sh` / `competitors_down.sh` | One-command bring-up/teardown of the competitor stacks (Letta server + Neo4j-for-Graphiti, both on host network → local Ollama, clients pip-installed, health-gated) |
 | `campaign_run.sh` | **Generic self-terminating campaign runner.** Launches a GPU box, provisions, gates, runs an arbitrary `REMOTE_CMD`, pulls `PULL_FILES`, and ALWAYS terminates (EXIT trap + deadline). |
 | `run_scale100k_durable.sh` | Durable scale run: DB + result on the persistent FS, resumable via `--skip-seed`, terminates only on a DONE marker or hard deadline (transient SSH failures are retried, never fatal) |
+| `run_scale1m_durable.sh` | Durable **1M** run: polls for a multi-GPU node in us-south-2 (prefers 8×H100), brings up the per-GPU fleet, fleet-embeds, measures uniform + warm-set recall; same DONE/deadline self-termination discipline |
 | `orchestrate_campaigns.sh` | Chains campaigns back-to-back, non-overlapping |
 | `gate.sh` | **Readiness gate** (run on the box): require a real `generate` (text) AND a real `embed` (dim>100) before benchmarking — stops connection-refused errors being recorded as fake 0.0 recall |
 | `coldstart_capture.sh` | Time a bare box → first grounded RAG answer; refuses to record a fake time if the answer errors |

@@ -47,7 +47,7 @@ its real OSS engine (Graphiti on Neo4j), whose 0.20 reflects lossy *local-model*
 extraction, not Zep Cloud (frontier models). See `results/competitors.json` and
 `competitors_bench.py`.
 
-### 1c. Recall by mode — 1,000,000 distinct entities (2×H100 fleet)
+### 1d. Recall by mode — 1,000,000 distinct entities (2×H100 fleet)
 | recall@k | keyword (fts5) | dense | hybrid |
 |---|---|---|---|
 | @1 | 0.001 | 0.262 | **0.634** |

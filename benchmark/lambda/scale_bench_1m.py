@@ -331,7 +331,21 @@ def main():
             "entities_embedded": n, "secs": dt, "entities_per_sec": round(n/dt,1) if dt else None,
             "dim": dim, "backend": f"{a.embedding_model} ({a.tier})"}
     else:
-        # fallback: binary serial embed (100k-style) — reopen MCP
+        # fallback: binary serial embed (100k-style) — reopen MCP.
+        # Coverage short-circuit (#619 validation run, 2026-07-13): with a
+        # fully-embedded reused corpus (--skip-seed) this loop degenerates to
+        # one no-op mimir_embed call per category — 10k categories × ~0.7s of
+        # category-filtered NULL-scan ≈ 2h of doing nothing at the 1M point.
+        # Skip it when the direct count says there is nothing to embed.
+        cc0 = sqlite3.connect(a.db, timeout=120)
+        pre_embedded = cc0.execute(
+            "SELECT COUNT(*) FROM entities WHERE emb_sig IS NOT NULL AND archived=0").fetchone()[0]
+        pre_total = cc0.execute("SELECT COUNT(*) FROM entities WHERE archived=0").fetchone()[0]
+        cc0.close()
+        if pre_embedded >= pre_total:
+            print(f"embedding already complete ({pre_embedded}/{pre_total}); "
+                  f"skipping serial embed", flush=True)
+            rows = []
         mcp = MCP(argv); t0 = time.time(); n = 0
         try:
             for c in sorted({c for c, _, _, _ in rows}):

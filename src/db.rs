@@ -61,6 +61,29 @@ impl EmbeddingCache {
     }
 }
 
+/// #619: resident sign-signature cache for the dense arm, opt-in via
+/// `MIMIR_DENSE_SIG_CACHE=1`. The Hamming prefilter (#507) is only as good as
+/// its coverage: the SQL sig scan is bounded by `max_scan` (50k default), so
+/// past 50k embedded rows candidates are an id-order sample and standalone
+/// dense recall degrades (0.859@100K → 0.458@1M, #619). This cache keeps every
+/// active row's (id, emb_sig) resident — ~90–140MB at 1M rows for 384-dim —
+/// so the prefilter covers 100% of the corpus; the oversampled exact rerank
+/// (phase 2) is unchanged. A binary-quantized flat index, not ANN: no graph to
+/// persist or maintain, and the exact path stays available via
+/// `MIMIR_DENSE_MAX_SCAN=0`.
+///
+/// Validity = two stamps checked per query, rebuilt on mismatch:
+/// - `embedded_rows`: the phase-0 active-signed row count (computed every
+///   dense query anyway) — catches inserts, deletes, archive/unarchive.
+/// - `write_gen`: `Database::sig_write_gen`, bumped by the in-place
+///   emb_sig writers (embed/re-embed/clear) — catches same-count updates.
+struct SigCache {
+    ids: Vec<String>,
+    sigs: Vec<Vec<u8>>,
+    embedded_rows: i64,
+    write_gen: u64,
+}
+
 /// #393: default bound for the background auto-embed queue. Each queued job
 /// holds the entity id + plaintext body (~1KB typical), so 1024 caps queue
 /// memory at roughly a megabyte. Overflow policy is drop-new (see
@@ -137,7 +160,15 @@ pub struct Database {
     /// #393: bound of the auto-embed queue; `EMBED_QUEUE_CAP` unless a test
     /// shrinks it to exercise the overflow path.
     embed_queue_cap: usize,
+    /// #619: opt-in resident sig cache for the dense arm (see `SigCache`).
+    sig_cache: std::sync::Mutex<Option<SigCache>>,
 }
+
+/// #619: bumped by every in-place emb_sig write; one of the sig cache's two
+/// validity stamps. Process-global (not per-Database) because the in-place
+/// writers are `Self`-less `*_with_conn` helpers — the cost is a spurious
+/// rebuild in multi-instance processes, never staleness.
+static SIG_WRITE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Configuration for the LLM integration (Ollama or OpenAI-compatible API).
 #[derive(Clone)]
@@ -502,6 +533,7 @@ impl Database {
             connectors: Vec::new(),
             embed_worker: std::sync::OnceLock::new(),
             embed_queue_cap: EMBED_QUEUE_CAP,
+            sig_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -1012,6 +1044,7 @@ impl Database {
             "UPDATE entities SET embedding = ?1, emb_sig = ?2 WHERE id = ?3",
             params![blob, sig, id],
         )?;
+        SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
         Ok(())
     }
 
@@ -1042,6 +1075,9 @@ impl Database {
                            WHERE f.rowid = entities.rowid AND f.body_json = ?4)",
             params![blob, sig, id, plaintext],
         )?;
+        if changed == 1 {
+            SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
+        }
         Ok(changed == 1)
     }
 
@@ -1763,7 +1799,12 @@ impl Database {
             Some(n) => n,
             None => 50_000,
         };
-        self.dense_search_scan_bounded(query_vec, limit, max_scan)
+        // #619: opt-in resident sig cache — full-corpus Hamming prefilter
+        // coverage instead of the first `max_scan` rows (see `SigCache`).
+        let use_sig_cache = std::env::var("MIMIR_DENSE_SIG_CACHE")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+        self.dense_search_with_opts(query_vec, limit, max_scan, use_sig_cache)
     }
 
     /// The `dense_search` implementation with the scan ceiling as an explicit
@@ -1775,6 +1816,19 @@ impl Database {
         query_vec: &[f32],
         limit: usize,
         max_scan: usize,
+    ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
+        self.dense_search_with_opts(query_vec, limit, max_scan, false)
+    }
+
+    /// Full-option `dense_search` implementation: scan ceiling AND sig-cache
+    /// toggle as explicit parameters, so tests exercise every mode without
+    /// process-global env races (#617/#627 pattern).
+    pub fn dense_search_with_opts(
+        &self,
+        query_vec: &[f32],
+        limit: usize,
+        max_scan: usize,
+        use_sig_cache: bool,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let dim = query_vec.len();
@@ -1835,32 +1889,89 @@ impl Database {
             // Rows with a NULL signature (written by a pre-v6 binary after
             // migration) are always included so they can't be silently lost.
             let query_sig = embedding_signature(query_vec);
-            // Covering-index scan (v18, #507) — see the count query's comment.
-            // Rows with an embedding but no signature no longer exist by the
-            // v18 invariant (the migration backfilled them; writers maintain
-            // both columns atomically), so the old unsigned-rows escape hatch
-            // is gone with the invariant that made it necessary.
-            let mut stmt = conn.prepare(&format!(
-                "SELECT id, emb_sig FROM entities \
-                 WHERE archived = 0 AND emb_sig IS NOT NULL LIMIT {}",
-                max_scan
-            ))?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                ))
-            })?;
-            let mut ranked: Vec<(u32, String)> = Vec::new();
-            for row in rows {
-                let (id, sig) = row?;
-                ranked.push((signature_hamming(&query_sig, &sig), id));
-            }
+            // #619: with the resident sig cache enabled, the Hamming prefilter
+            // ranks over EVERY active signed row instead of the first
+            // `max_scan` by id — full-corpus coverage is the entire point, so
+            // the scan bound deliberately does not apply to this path (the
+            // exact escape hatch remains `MIMIR_DENSE_MAX_SCAN=0` with the
+            // cache off). Cache validity is re-checked against both stamps on
+            // every query; on mismatch it rebuilds from the same covering
+            // index the SQL path scans.
             let pool = pool_target(limit);
-            ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            ranked.truncate(pool);
-            let pool_ids: Vec<String> =
-                ranked.into_iter().map(|(_, id)| id).collect();
+            let pool_ids: Vec<String> = if use_sig_cache {
+                let write_gen = SIG_WRITE_GEN.load(std::sync::atomic::Ordering::Relaxed);
+                let mut guard = self
+                    .sig_cache
+                    .lock()
+                    .map_err(|_| "sig cache mutex poisoned")?;
+                let stale = match guard.as_ref() {
+                    Some(c) => c.embedded_rows != embedded_rows || c.write_gen != write_gen,
+                    None => true,
+                };
+                if stale {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, emb_sig FROM entities \
+                         WHERE archived = 0 AND emb_sig IS NOT NULL",
+                    )?;
+                    let rows = stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })?;
+                    let mut ids = Vec::new();
+                    let mut sigs = Vec::new();
+                    for row in rows {
+                        let (id, sig) = row?;
+                        ids.push(id);
+                        sigs.push(sig);
+                    }
+                    *guard = Some(SigCache { ids, sigs, embedded_rows, write_gen });
+                }
+                let cache = guard.as_ref().expect("sig cache built above");
+                // Rank row INDICES (no per-row String clone at corpus scale);
+                // (distance, id) tie-break matches the SQL path exactly, so
+                // both modes return identical results whenever the SQL path's
+                // bounded scan happens to cover the whole corpus.
+                let mut ranked: Vec<(u32, u32)> = cache
+                    .sigs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sig)| (signature_hamming(&query_sig, sig), i as u32))
+                    .collect();
+                ranked.sort_by(|a, b| {
+                    a.0.cmp(&b.0).then_with(|| {
+                        cache.ids[a.1 as usize].cmp(&cache.ids[b.1 as usize])
+                    })
+                });
+                ranked.truncate(pool);
+                ranked
+                    .into_iter()
+                    .map(|(_, i)| cache.ids[i as usize].clone())
+                    .collect()
+            } else {
+                // Covering-index scan (v18, #507) — see the count query's comment.
+                // Rows with an embedding but no signature no longer exist by the
+                // v18 invariant (the migration backfilled them; writers maintain
+                // both columns atomically), so the old unsigned-rows escape hatch
+                // is gone with the invariant that made it necessary.
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT id, emb_sig FROM entities \
+                     WHERE archived = 0 AND emb_sig IS NOT NULL LIMIT {}",
+                    max_scan
+                ))?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                    ))
+                })?;
+                let mut ranked: Vec<(u32, String)> = Vec::new();
+                for row in rows {
+                    let (id, sig) = row?;
+                    ranked.push((signature_hamming(&query_sig, &sig), id));
+                }
+                ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                ranked.truncate(pool);
+                ranked.into_iter().map(|(_, id)| id).collect()
+            };
 
             // Fetch full embeddings for the pool only (chunked IN to bound
             // SQL variable count).
@@ -3158,6 +3269,7 @@ impl Database {
                         embedding = NULL, emb_sig = NULL WHERE id = ?3",
                     params![now, history_id, id, valid_from.unwrap_or(now), valid_to],
                 )?;
+                SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
             } else if let Some(old_eff_from) = audit_reassert_from {
                 // #371: the audited re-assert is a new version of knowledge
                 // recorded at `now` — advance recorded_at and link back to the
@@ -11790,6 +11902,7 @@ mod tests {
             connectors: Vec::new(),
             embed_worker: std::sync::OnceLock::new(),
             embed_queue_cap: EMBED_QUEUE_CAP,
+            sig_cache: std::sync::Mutex::new(None),
         };
 
         db.remember_skip_dedup(&make_entity(
@@ -17173,6 +17286,86 @@ mod tests {
         // Default entrypoint (env unset → 50k ceiling) covers the whole corpus.
         let default = db.dense_search(&query, 5).unwrap();
         assert_eq!(default[0].0.id, "zzz-hit");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dense_sig_cache_full_coverage_and_both_invalidation_stamps() {
+        // #619: the resident sig cache ranks EVERY active signed row, so a hit
+        // beyond a small `max_scan` is found anyway (full coverage is the
+        // point), and the cache must go stale on BOTH stamp kinds: a count
+        // change (archive/insert/delete) and a same-count in-place re-embed
+        // (SIG_WRITE_GEN via the store_embedding helpers).
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let dim = 16usize;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, emb_sig, archived)
+                     VALUES (?1, 'insight', ?2, '{}', 'insight', 'active', 0, 0, 0,
+                             1.0, 'working', ?3, ?4, 0)",
+                )
+                .unwrap();
+            // 2200 fillers (over DENSE_SIG_PREFILTER_MIN_ROWS so the sig path
+            // runs), same deterministic spread as the prefilter scale test.
+            for i in 1..=2200u32 {
+                let v: Vec<f32> = (0..dim)
+                    .map(|d| {
+                        let bit = (i.wrapping_mul(2654435761) >> (d as u32 % 31)) & 1;
+                        if bit == 1 { -1.0 } else { 0.3 }
+                    })
+                    .collect();
+                stmt.execute(params![
+                    format!("filler-{:05}", i),
+                    format!("filler-key-{:05}", i),
+                    blob(&v),
+                    embedding_signature(&v)
+                ])
+                .unwrap();
+            }
+            let query: Vec<f32> = vec![1.0; dim];
+            stmt.execute(params![
+                "zzz-hit", "zzz-hit-key", blob(&query), embedding_signature(&query)
+            ])
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let query: Vec<f32> = vec![1.0; dim];
+
+        // The SQL path at max_scan=100 cannot reach the 2201st row…
+        let bounded = db.dense_search_with_opts(&query, 5, 100, false).unwrap();
+        assert!(!bounded.iter().any(|(e, _)| e.id == "zzz-hit"));
+        // …the cache path finds it despite the same bound: full coverage.
+        let cached = db.dense_search_with_opts(&query, 5, 100, true).unwrap();
+        assert_eq!(cached[0].0.id, "zzz-hit", "sig cache must cover the whole corpus");
+
+        // Stamp 1 — count change: archiving the hit must evict it on the very
+        // next query (the cache rebuilds; archived rows are not in it).
+        conn.execute("UPDATE entities SET archived = 1 WHERE id = 'zzz-hit'", [])
+            .unwrap();
+        let after_archive = db.dense_search_with_opts(&query, 5, 100, true).unwrap();
+        assert!(
+            !after_archive.iter().any(|(e, _)| e.id == "zzz-hit"),
+            "archived row leaked from a stale sig cache"
+        );
+
+        // Stamp 2 — same-count in-place re-embed: rewrite one filler to BE the
+        // query vector through the store_embedding helper (bumps
+        // SIG_WRITE_GEN; row count unchanged). The stale cache still holds its
+        // old far-away signature — only the gen stamp can catch this.
+        Database::store_embedding_with_conn(&conn, "filler-00042", &query).unwrap();
+        let after_reembed = db.dense_search_with_opts(&query, 5, 100, true).unwrap();
+        assert_eq!(
+            after_reembed[0].0.id, "filler-00042",
+            "in-place re-embed missed: SIG_WRITE_GEN stamp failed"
+        );
 
         let _ = fs::remove_file(&path);
     }

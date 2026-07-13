@@ -990,6 +990,7 @@ impl Database {
                             follow_rate: 0.0,
                             efficacy_status: "unverified".to_string(),
                             embedding: None,
+                            _parsed_body: None,
                         };
                         match self.remember(&entity) {
                             Ok(_) => ingested += 1,
@@ -4268,7 +4269,7 @@ impl Database {
         let rows = stmt.query_map(params![fts_query, (max as i64) + 1], |r| {
             r.get::<_, i64>(0)
         })?;
-        let mut out: Vec<i64> = Vec::new();
+        let mut out: Vec<i64> = Vec::with_capacity(max + 1);
         for r in rows {
             out.push(r?);
             if out.len() > max {
@@ -4303,11 +4304,11 @@ impl Database {
         let enc = self.encryption.as_ref();
         let rows = stmt.query_map(param_refs.as_slice(), |row| entity_from_row(row, enc))?;
 
-        let mut items = Vec::new();
+        let mut items = Vec::with_capacity(params.limit.max(0) as usize);
         // #207: collect matched ids and apply retrieval-count/recency/decay/layer
         // side-effects in one batched UPDATE after the loop, instead of one
         // write per returned row on this read-mostly hot path.
-        let mut hit_ids: Vec<String> = Vec::new();
+        let mut hit_ids: Vec<String> = Vec::with_capacity(params.limit.max(0) as usize);
         for row in rows {
             let mut entity = row?;
             if !params.skip_side_effects {
@@ -7146,6 +7147,7 @@ impl Database {
                     follow_rate: 0.0,
                     efficacy_status: "unverified".to_string(),
                     embedding: None,
+                    _parsed_body: None,
                     created_at_unix_ms: now,
                     last_accessed_unix_ms: now,
                 };
@@ -7504,6 +7506,7 @@ impl Database {
                             follow_rate: 0.0,
                             efficacy_status: "unverified".to_string(),
                             embedding: None,
+                            _parsed_body: None,
                             created_at_unix_ms: now,
                             last_accessed_unix_ms: now,
                         };
@@ -8747,6 +8750,7 @@ last_accessed: {}
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
             };
 
             match self.remember(&entity) {
@@ -9516,6 +9520,7 @@ last_accessed: {}
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
                 created_at_unix_ms: now,
                 last_accessed_unix_ms: now,
             };
@@ -9815,6 +9820,7 @@ last_accessed: {}
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             embedding: None,
+            _parsed_body: None,
             created_at_unix_ms: now,
             last_accessed_unix_ms: now,
         };
@@ -9965,6 +9971,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
                 follow_rate: 0.0,
                 efficacy_status: "unverified".to_string(),
                 embedding: None,
+                _parsed_body: None,
                 created_at_unix_ms: now,
                 last_accessed_unix_ms: now,
             };
@@ -10041,7 +10048,7 @@ If no clear lessons found, return: {{"lessons": []}}"#,
             miss_count: 0,
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
-            embedding: None, created_at_unix_ms: now,
+            embedding: None, _parsed_body: None, created_at_unix_ms: now,
             last_accessed_unix_ms: now,
         };
         self.remember(&entity)?;
@@ -11424,6 +11431,8 @@ fn entity_from_row(
         raw_body_json
     };
 
+    let parsed_body: Option<serde_json::Value> = serde_json::from_str(&body_json).ok();
+
     Ok(Entity {
         id: row.get(0)?,
         category: row.get(1)?,
@@ -11456,6 +11465,7 @@ fn entity_from_row(
             .unwrap_or(None)
             .unwrap_or_else(|| "unverified".to_string()),
         embedding: None,
+        _parsed_body: parsed_body,
     })
 }
 
@@ -11511,6 +11521,7 @@ mod tests {
             follow_rate: 0.0,
             efficacy_status: "unverified".to_string(),
             embedding: None,
+            _parsed_body: None,
         }
     }
 

@@ -20,7 +20,7 @@
 Give your agents memory that survives the session, so they stop re-deriving what they
 already learned and stop repeating past mistakes. Hybrid recall (BM25 + dense + RRF),
 bi-temporal history, and **AES-256-GCM** at rest, exposed as **55+ MCP tools** that work
-with any host. **73.6% on LongMemEval's official harness** (vs Zep 63.8%, Mem0 49.0%).
+with any host. **73.8% on LongMemEval's official harness** (vs Zep 63.8%, Mem0 49.0%).
 **One binary. One file. No Docker. No Postgres. No cloud.** Local-first, air-gap ready, MIT.
 
 ## One-Line Install
@@ -125,7 +125,7 @@ Recall quality measured on LongMemEval's **official** harness, not a home-grown 
 
 | Memory engine | QA accuracy |
 |---|---|
-| **Perseus Vault** | **73.6%** |
+| **Perseus Vault** | **73.8%** |
 | Zep | 63.8% (published) |
 | Mem0 | 49.0% (published) |
 

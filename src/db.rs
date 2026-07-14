@@ -1951,6 +1951,19 @@ impl Database {
                     *guard = Some(SigCache { ids, sigs, embedded_rows, write_gen });
                 }
                 let cache = guard.as_ref().expect("sig cache built above");
+                // #619 step 1.5a: the full-corpus prefilter feeds a LARGER
+                // exact-rerank pool than the bounded scan's fixed
+                // pool_target. Measured at 1M (PR #652): with pool=512 of 1M,
+                // coverage is complete (warm==uniform) but dense@5 caps at
+                // 0.659 — true neighbors get pushed below the cutoff by
+                // 1-bit quantization noise. Scale the pool with the corpus
+                // (1 per 256 rows → ~3.9k@1M) inside [pool_target, 8192]
+                // guardrails; the exact rerank pays ~3KB/candidate, so 8k
+                // candidates is ~24MB of page-cached reads, not a scan.
+                let pool = pool
+                    .max(cache.ids.len() / 256)
+                    .min(8192)
+                    .min(cache.ids.len().max(1));
                 // Rank row INDICES (no per-row String clone at corpus scale);
                 // (distance, id) tie-break matches the SQL path exactly, so
                 // both modes return identical results whenever the SQL path's
@@ -1961,12 +1974,22 @@ impl Database {
                     .enumerate()
                     .map(|(i, sig)| (signature_hamming(&query_sig, sig), i as u32))
                     .collect();
-                ranked.sort_by(|a, b| {
+                let cmp = |a: &(u32, u32), b: &(u32, u32)| {
                     a.0.cmp(&b.0).then_with(|| {
                         cache.ids[a.1 as usize].cmp(&cache.ids[b.1 as usize])
                     })
-                });
-                ranked.truncate(pool);
+                };
+                // #619 step 1.5b: partial-select the top `pool` then sort only
+                // those — O(n + pool·log pool) instead of O(n·log n). Fully
+                // sorting 1M (distance, idx) pairs dominated the cache arm's
+                // p50 (+270ms vs the bounded scan in PR #652); selection is
+                // O(n) and order-identical after the final sort (same
+                // comparator, total order — ties broken by unique id).
+                if ranked.len() > pool {
+                    ranked.select_nth_unstable_by(pool - 1, cmp);
+                    ranked.truncate(pool);
+                }
+                ranked.sort_by(cmp);
                 ranked
                     .into_iter()
                     .map(|(_, i)| cache.ids[i as usize].clone())

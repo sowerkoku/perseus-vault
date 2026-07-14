@@ -1050,9 +1050,10 @@ impl Database {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let sig = embedding_signature(embedding);
+        let sig4 = embedding_sig4(embedding);
         conn.execute(
-            "UPDATE entities SET embedding = ?1, emb_sig = ?2 WHERE id = ?3",
-            params![blob, sig, id],
+            "UPDATE entities SET embedding = ?1, emb_sig = ?2, emb_sig4 = ?3 WHERE id = ?4",
+            params![blob, sig, sig4, id],
         )?;
         SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
         Ok(())
@@ -1078,12 +1079,13 @@ impl Database {
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         let sig = embedding_signature(embedding);
+        let sig4 = embedding_sig4(embedding);
         let changed = conn.execute(
-            "UPDATE entities SET embedding = ?1, emb_sig = ?2
-             WHERE id = ?3
+            "UPDATE entities SET embedding = ?1, emb_sig = ?2, emb_sig4 = ?3
+             WHERE id = ?4
                AND EXISTS (SELECT 1 FROM entities_fts f
-                           WHERE f.rowid = entities.rowid AND f.body_json = ?4)",
-            params![blob, sig, id, plaintext],
+                           WHERE f.rowid = entities.rowid AND f.body_json = ?5)",
+            params![blob, sig, sig4, id, plaintext],
         )?;
         if changed == 1 {
             SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
@@ -2029,6 +2031,32 @@ impl Database {
                 let sl = cache.sig_len.max(1);
                 let row_sig = |r: usize| &cache.sigs[r * sl..(r + 1) * sl];
                 if asym {
+                    // #619 step 2b: two-stage prefilter. The 1-bit asymmetric
+                    // score ranks the WHOLE corpus down to a COARSE pool
+                    // (default 8×pool clamped [16k, 64k]); the int4 ADC tier
+                    // (emb_sig4, ~scale·⟨q,quant(v)⟩ ≈ ⟨q,v⟩) then re-ranks
+                    // that coarse pool down to the exact-rerank pool. int4
+                    // codes are read per query through the covering index —
+                    // ~25MB page-cached at 64k×768-dim, deliberately NOT
+                    // resident (the spec's memory budget). MIMIR_DENSE_SIG4=0
+                    // disables the refine (pure step-2a behavior) for A/B;
+                    // MIMIR_DENSE_COARSE_POOL overrides the coarse size.
+                    let refine = !matches!(
+                        std::env::var("MIMIR_DENSE_SIG4")
+                            .unwrap_or_default()
+                            .trim()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "0" | "false" | "off"
+                    );
+                    let coarse = std::env::var("MIMIR_DENSE_COARSE_POOL")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or_else(|| (pool * 8).clamp(16_384, 65_536))
+                        .max(pool)
+                        .min(n);
+                    let keep = if refine { coarse } else { pool };
+
                     let luts = build_asym_luts(query_vec, sl);
                     let mut ranked: Vec<(f32, u32)> = (0..n)
                         .map(|r| (asym_sig_score(&luts, row_sig(r)), r as u32))
@@ -2040,15 +2068,76 @@ impl Database {
                                 cache.ids[a.1 as usize].cmp(&cache.ids[b.1 as usize])
                             })
                     };
-                    if ranked.len() > pool {
-                        ranked.select_nth_unstable_by(pool - 1, cmp);
-                        ranked.truncate(pool);
+                    if ranked.len() > keep {
+                        ranked.select_nth_unstable_by(keep - 1, cmp);
+                        ranked.truncate(keep);
                     }
                     ranked.sort_by(cmp);
-                    ranked
+                    let coarse_ids: Vec<String> = ranked
                         .into_iter()
                         .map(|(_, i)| cache.ids[i as usize].clone())
-                        .collect()
+                        .collect();
+                    if !refine || coarse_ids.len() <= pool {
+                        let mut ids = coarse_ids;
+                        ids.truncate(pool);
+                        ids
+                    } else {
+                        // Fetch int4 codes for the coarse pool (covering
+                        // index; no row-record/body reads) and ADC-rank.
+                        // Rows without a code (written by a pre-v19 binary
+                        // after migration, or a foreign dim) keep their
+                        // coarse order and get a RESERVED share of the pool
+                        // (up to 1/16) after the ADC-ranked rows — freshly
+                        // written rows are often the most relevant, so they
+                        // must reach the exact rerank rather than be crowded
+                        // out wholesale. Post-migration + current writers,
+                        // this set is empty and the reservation is zero.
+                        let sig4_luts = build_sig4_luts(query_vec, dim.div_ceil(2));
+                        let mut scored: Vec<(f32, &String)> = Vec::with_capacity(coarse_ids.len());
+                        let mut unscored: Vec<&String> = Vec::new();
+                        let mut sig4_by_id: std::collections::HashMap<String, Vec<u8>> =
+                            std::collections::HashMap::with_capacity(coarse_ids.len());
+                        for chunk in coarse_ids.chunks(500) {
+                            let placeholders = vec!["?"; chunk.len()].join(",");
+                            let sql = format!(
+                                "SELECT id, emb_sig4 FROM entities \
+                                 WHERE id IN ({placeholders}) AND emb_sig4 IS NOT NULL"
+                            );
+                            let mut qstmt = conn.prepare(&sql)?;
+                            let refs: Vec<&dyn rusqlite::types::ToSql> = chunk
+                                .iter()
+                                .map(|s| s as &dyn rusqlite::types::ToSql)
+                                .collect();
+                            let qrows = qstmt.query_map(refs.as_slice(), |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                            })?;
+                            for r in qrows {
+                                let (id, s4) = r?;
+                                sig4_by_id.insert(id, s4);
+                            }
+                        }
+                        for id in &coarse_ids {
+                            match sig4_by_id.get(id).and_then(|s4| sig4_score(&sig4_luts, s4)) {
+                                Some(s) => scored.push((s, id)),
+                                None => unscored.push(id),
+                            }
+                        }
+                        scored.sort_by(|a, b| {
+                            b.0.partial_cmp(&a.0)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.1.cmp(b.1))
+                        });
+                        let reserved = unscored.len().min((pool / 16).max(1));
+                        let mut ids: Vec<String> = scored
+                            .into_iter()
+                            .take(pool.saturating_sub(reserved))
+                            .map(|(_, id)| id.clone())
+                            .collect();
+                        for id in unscored.into_iter().take(reserved) {
+                            ids.push(id.clone());
+                        }
+                        ids
+                    }
                 } else {
                     let mut ranked: Vec<(u32, u32)> = (0..n)
                         .map(|r| (signature_hamming(&query_sig, row_sig(r)), r as u32))
@@ -3405,7 +3494,7 @@ impl Database {
                 tx.execute(
                     "UPDATE entities SET recorded_at_unix_ms = ?1, supersedes = ?2,
                         valid_from_unix_ms = ?4, valid_to_unix_ms = ?5,
-                        embedding = NULL, emb_sig = NULL WHERE id = ?3",
+                        embedding = NULL, emb_sig = NULL, emb_sig4 = NULL WHERE id = ?3",
                     params![now, history_id, id, valid_from.unwrap_or(now), valid_to],
                 )?;
                 SIG_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // #619
@@ -11494,6 +11583,68 @@ fn asym_sig_score(luts: &[[f32; 256]], sig: &[u8]) -> f32 {
         .sum()
 }
 
+/// #619 step 2b: 4-bit scalar quantization of an embedding — the int4 refine
+/// tier between the 1-bit coarse prefilter and the exact-f32 rerank.
+/// Layout: 4 bytes little-endian f32 `scale`, then ceil(dim/2) bytes of
+/// nibbles (dim 2p in the LOW nibble of byte p, dim 2p+1 in the HIGH).
+/// Code for dim i: `clamp(round(v[i]/scale), -7, 7) + 8` (1..=15; 0 only as
+/// padding in a ragged final nibble). `scale = max|v|/7`, so the dominant
+/// dim always survives quantization. An all-zero vector stores scale 0 and
+/// all-zero codes; the ADC score is then 0 — harmless, matches its true dot.
+pub(crate) fn embedding_sig4(v: &[f32]) -> Vec<u8> {
+    let max_abs = v.iter().fold(0f32, |m, &x| m.max(x.abs()));
+    let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 0.0 };
+    let mut out = Vec::with_capacity(4 + v.len().div_ceil(2));
+    out.extend_from_slice(&scale.to_le_bytes());
+    let code = |x: f32| -> u8 {
+        if scale == 0.0 {
+            8
+        } else {
+            ((x / scale).round().clamp(-7.0, 7.0) as i32 + 8) as u8
+        }
+    };
+    for pair in v.chunks(2) {
+        let lo = code(pair[0]) & 0x0F;
+        let hi = if pair.len() > 1 { code(pair[1]) & 0x0F } else { 0 };
+        out.push(lo | (hi << 4));
+    }
+    out
+}
+
+/// Per-byte LUTs for int4 ADC scoring (#619 step 2b): `LUT[p][b]` is the
+/// contribution of code byte `b` at position `p` to `Σ q[i]·code(v[i])` —
+/// i.e. `q[2p]·(lo−8) + q[2p+1]·(hi−8)`. The final score multiplies by the
+/// row's stored scale, approximating the true dot ⟨q, v⟩.
+fn build_sig4_luts(query_vec: &[f32], n_bytes: usize) -> Vec<[f32; 256]> {
+    let mut luts = vec![[0f32; 256]; n_bytes];
+    for (p, lut) in luts.iter_mut().enumerate() {
+        let q0 = query_vec.get(2 * p).copied().unwrap_or(0.0);
+        let q1 = query_vec.get(2 * p + 1).copied().unwrap_or(0.0);
+        for (b, slot) in lut.iter_mut().enumerate() {
+            let lo = (b & 0x0F) as i32 - 8;
+            let hi = ((b >> 4) & 0x0F) as i32 - 8;
+            *slot = q0 * lo as f32 + q1 * hi as f32;
+        }
+    }
+    luts
+}
+
+/// ADC score of one `embedding_sig4` blob: `scale · Σ LUT[p][codes[p]]` ≈
+/// ⟨q, v⟩. Returns `None` on a malformed/foreign-length blob so the caller
+/// can fall back rather than mis-rank.
+fn sig4_score(luts: &[[f32; 256]], blob: &[u8]) -> Option<f32> {
+    if blob.len() != 4 + luts.len() {
+        return None;
+    }
+    let scale = f32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+    let sum: f32 = blob[4..]
+        .iter()
+        .zip(luts)
+        .map(|(&byte, lut)| lut[byte as usize])
+        .sum();
+    Some(scale * sum)
+}
+
 /// Hamming distance between two signatures. Length mismatch (different
 /// embedding dims) scores maximally distant so it can never win a slot.
 fn signature_hamming(a: &[u8], b: &[u8]) -> u32 {
@@ -17662,6 +17813,154 @@ mod tests {
             top[0].0.id, "true-neighbor",
             "asymmetric prefilter must surface the magnitude-dominant true \
              neighbor that symmetric Hamming ranks dead last"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sig4_adc_score_approximates_the_true_dot() {
+        // #619 step 2b: scale·ΣLUT ≈ ⟨q, v⟩ within quantization error. The
+        // per-dim error is ≤ scale/2, so |ADC − dot| ≤ Σ|q_i|·scale/2.
+        let q: Vec<f32> = (0..37).map(|i| (i as f32 * 0.43).sin()).collect();
+        let v: Vec<f32> = (0..37).map(|i| (i as f32 * 0.77).cos() * 1.7).collect();
+        let blob = embedding_sig4(&v);
+        assert_eq!(blob.len(), 4 + 19, "37 dims → 4B scale + 19 nibble bytes");
+        let luts = build_sig4_luts(&q, 19);
+        let got = sig4_score(&luts, &blob).expect("well-formed blob scores");
+        let dot: f32 = q.iter().zip(&v).map(|(a, b)| a * b).sum();
+        let scale = v.iter().fold(0f32, |m, &x| m.max(x.abs())) / 7.0;
+        let bound: f32 = q.iter().map(|x| x.abs()).sum::<f32>() * scale * 0.5 + 1e-3;
+        assert!(
+            (got - dot).abs() <= bound,
+            "ADC {got} vs dot {dot} exceeds quantization bound {bound}"
+        );
+        // Foreign-length blob refuses to score instead of mis-ranking.
+        assert!(sig4_score(&luts, &blob[..10]).is_none());
+    }
+
+    #[test]
+    fn int4_refine_separates_rows_the_one_bit_prefilter_cannot() {
+        // #619 step 2b, the failure mode it ships to fix: rows with IDENTICAL
+        // sign patterns are indistinguishable to any 1-bit scoring (symmetric
+        // or asymmetric) — the coarse rank degenerates to the id tie-break.
+        // 2,500 all-positive low-magnitude decoys + one all-positive
+        // high-magnitude true neighbor whose id sorts LAST: without the int4
+        // tier the tie-break exiles it below any pool ≤ 2,500; the int4 ADC
+        // (which sees magnitudes) must put it first.
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let dim = 16usize;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, emb_sig, emb_sig4, archived)
+                     VALUES (?1, 'insight', ?2, '{}', 'insight', 'active', 0, 0, 0,
+                             1.0, 'working', ?3, ?4, ?5, 0)",
+                )
+                .unwrap();
+            // sign(decoy) == sign(neighbor) == sign(q): every 1-bit scoring
+            // ties all rows. Alternating magnitudes keep the decoys OFF the
+            // query direction (cosine ≈ 0.95 < 1.0) so the exact rerank has a
+            // true winner once the int4 tier gets the neighbor into the pool.
+            let decoy: Vec<f32> = (0..dim)
+                .map(|d| if d % 2 == 0 { 0.05f32 } else { 0.10f32 })
+                .collect();
+            for i in 1..=2500u32 {
+                stmt.execute(params![
+                    format!("decoy-{:05}", i),
+                    format!("decoy-key-{:05}", i),
+                    blob(&decoy),
+                    embedding_signature(&decoy),
+                    embedding_sig4(&decoy)
+                ])
+                .unwrap();
+            }
+            let neighbor = vec![1.0f32; dim];
+            stmt.execute(params![
+                "zzz-neighbor", "zzz-neighbor-key",
+                blob(&neighbor), embedding_signature(&neighbor),
+                embedding_sig4(&neighbor)
+            ])
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let q = vec![1.0f32; dim];
+        // Force the cache; defaults: asym coarse + int4 refine. limit 1 →
+        // pool 512 < 2,501, so the tie-break alone would exile zzz-neighbor.
+        let top = db.dense_search_with_opts(&q, 1, 100, Some(true)).unwrap();
+        assert_eq!(
+            top[0].0.id, "zzz-neighbor",
+            "int4 refine must surface the magnitude-dominant neighbor that \
+             every 1-bit scoring ties with the decoys (and the id tie-break \
+             then exiles)"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rows_without_sig4_still_reach_the_pool_after_scored_rows() {
+        // Transitional safety (#619 step 2b): rows written by a pre-v19
+        // binary after migration have NULL emb_sig4. They must not vanish
+        // from dense recall — they append after ADC-ranked rows and still
+        // reach the exact rerank when the pool has room.
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let dim = 16usize;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, emb_sig, emb_sig4, archived)
+                     VALUES (?1, 'insight', ?2, '{}', 'insight', 'active', 0, 0, 0,
+                             1.0, 'working', ?3, ?4, ?5, 0)",
+                )
+                .unwrap();
+            // Fillers point away from the query; all carry sig4.
+            for i in 1..=2200u32 {
+                let v: Vec<f32> = (0..dim)
+                    .map(|d| {
+                        let bit = (i.wrapping_mul(2654435761) >> (d as u32 % 31)) & 1;
+                        if bit == 1 { -1.0 } else { 0.3 }
+                    })
+                    .collect();
+                stmt.execute(params![
+                    format!("filler-{:05}", i),
+                    format!("filler-key-{:05}", i),
+                    blob(&v),
+                    embedding_signature(&v),
+                    embedding_sig4(&v)
+                ])
+                .unwrap();
+            }
+        }
+        // The true nearest neighbor, written WITHOUT sig4 (old-binary shape).
+        let query: Vec<f32> = vec![1.0; dim];
+        conn.execute(
+            "INSERT INTO entities (id, category, key, body_json, type, status,
+                retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                decay_score, layer, embedding, emb_sig, emb_sig4, archived)
+             VALUES ('zzz-nosig4', 'insight', 'zzz-nosig4-key', '{}', 'insight',
+                     'active', 0, 0, 0, 1.0, 'working', ?1, ?2, NULL, 0)",
+            params![blob(&query), embedding_signature(&query)],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let results = db.dense_search_with_opts(&query, 5, 100, Some(true)).unwrap();
+        assert_eq!(
+            results[0].0.id, "zzz-nosig4",
+            "a NULL-sig4 row must still reach the exact rerank (which then \
+             ranks it by its true cosine), not vanish from dense recall"
         );
 
         let _ = fs::remove_file(&path);

@@ -227,7 +227,12 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// backfills emb_sig from every stored embedding (a pure function of the
 /// vector), making "embedded ⟺ signed" an invariant — writers already set
 /// and clear both columns together.
-const SCHEMA_VERSION: i64 = 18;
+/// v19 (#619 step 2b): `emb_sig4` — 4-bit scalar-quantized embedding codes
+/// (per-row scale + nibbles) for the int4 ADC refine tier between the 1-bit
+/// coarse prefilter and the exact rerank, plus its covering index. Backfilled
+/// from stored vectors at migration; writers maintain the column alongside
+/// embedding/emb_sig.
+const SCHEMA_VERSION: i64 = 19;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -680,6 +685,41 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
            ON entities(archived, id, emb_sig) WHERE emb_sig IS NOT NULL;",
     )?;
     // ── end v18 ──────────────────────────────────────────────────────────
+
+    // ── v19 (#619 step 2b): int4 refine tier ─────────────────────────────
+    // 4-bit scalar-quantized codes (per-row scale + dim/2 nibble bytes) sit
+    // between the 1-bit coarse prefilter and the exact-f32 rerank. Same shape
+    // as v18: additive column, pure-recompute backfill from the stored
+    // vector FIRST (extending the invariant to "embedded ⟺ signed ⟺ coded" —
+    // writers set/clear all three together), then a covering index so the
+    // per-query code fetch for the coarse pool never touches an entity
+    // record (multi-KB body overflow chains).
+    ensure_column(conn, "entities", "emb_sig4", "BLOB")?;
+    {
+        let mut missing = conn.prepare(
+            "SELECT id, embedding FROM entities \
+             WHERE embedding IS NOT NULL AND emb_sig4 IS NULL",
+        )?;
+        let rows: Vec<(String, Vec<u8>)> = missing
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .flatten()
+            .collect();
+        for (id, blob) in rows {
+            let vec: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            conn.execute(
+                "UPDATE entities SET emb_sig4 = ?1 WHERE id = ?2",
+                rusqlite::params![crate::db::embedding_sig4(&vec), id],
+            )?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_entities_dense_sig4
+           ON entities(id, emb_sig4) WHERE emb_sig4 IS NOT NULL;",
+    )?;
+    // ── end v19 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

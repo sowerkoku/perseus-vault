@@ -79,7 +79,16 @@ impl EmbeddingCache {
 ///   emb_sig writers (embed/re-embed/clear) — catches same-count updates.
 struct SigCache {
     ids: Vec<String>,
-    sigs: Vec<Vec<u8>>,
+    /// One CONTIGUOUS buffer of `ids.len() * sig_len` bytes (#619 step 2a):
+    /// row r's signature is `sigs[r*sig_len..(r+1)*sig_len]`. Flat beats
+    /// `Vec<Vec<u8>>` on both memory (~24MB of Vec headers at 1M rows) and
+    /// scan locality, and the LUT scorer needs the fixed stride. Rows whose
+    /// stored sig length differs from `sig_len` (mixed embedding dims after a
+    /// model change) are zero-filled here — they score arbitrarily in the
+    /// prefilter but can never surface: phase 2's exact rerank drops them on
+    /// the dim check, same end state as the old per-row length-mismatch path.
+    sigs: Vec<u8>,
+    sig_len: usize,
     embedded_rows: i64,
     write_gen: u64,
 }
@@ -1967,14 +1976,25 @@ impl Database {
                     let rows = stmt.query_map([], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
                     })?;
-                    let mut ids = Vec::new();
-                    let mut sigs = Vec::new();
+                    let mut ids: Vec<String> = Vec::new();
+                    let mut flat: Vec<u8> = Vec::new();
+                    let mut sig_len = 0usize;
                     for row in rows {
                         let (id, sig) = row?;
+                        if sig_len == 0 {
+                            sig_len = sig.len();
+                        }
+                        // Flat slot per row; a dim-mismatched sig zero-fills
+                        // (see the SigCache field comment — phase 2 drops it).
+                        let start = flat.len();
+                        flat.resize(start + sig_len, 0);
+                        if sig.len() == sig_len {
+                            flat[start..start + sig_len].copy_from_slice(&sig);
+                        }
                         ids.push(id);
-                        sigs.push(sig);
                     }
-                    *guard = Some(SigCache { ids, sigs, embedded_rows, write_gen });
+                    *guard = Some(SigCache { ids, sigs: flat, sig_len,
+                                             embedded_rows, write_gen });
                 }
                 let cache = guard.as_ref().expect("sig cache built above");
                 // #619 step 1.5a: the full-corpus prefilter feeds a LARGER
@@ -1990,36 +2010,64 @@ impl Database {
                     .max(cache.ids.len() / 256)
                     .min(8192)
                     .min(cache.ids.len().max(1));
-                // Rank row INDICES (no per-row String clone at corpus scale);
-                // (distance, id) tie-break matches the SQL path exactly, so
-                // both modes return identical results whenever the SQL path's
-                // bounded scan happens to cover the whole corpus.
-                let mut ranked: Vec<(u32, u32)> = cache
-                    .sigs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, sig)| (signature_hamming(&query_sig, sig), i as u32))
-                    .collect();
-                let cmp = |a: &(u32, u32), b: &(u32, u32)| {
-                    a.0.cmp(&b.0).then_with(|| {
-                        cache.ids[a.1 as usize].cmp(&cache.ids[b.1 as usize])
-                    })
-                };
-                // #619 step 1.5b: partial-select the top `pool` then sort only
-                // those — O(n + pool·log pool) instead of O(n·log n). Fully
-                // sorting 1M (distance, idx) pairs dominated the cache arm's
-                // p50 (+270ms vs the bounded scan in PR #652); selection is
-                // O(n) and order-identical after the final sort (same
-                // comparator, total order — ties broken by unique id).
-                if ranked.len() > pool {
-                    ranked.select_nth_unstable_by(pool - 1, cmp);
-                    ranked.truncate(pool);
+                // #619 step 2a: rank by the ASYMMETRIC score ⟨q, sign(v)⟩
+                // (higher = closer) — the full-precision query's magnitudes
+                // stay in the ranking instead of being discarded by symmetric
+                // sign-vs-sign Hamming. Same partial-select-then-sort shape as
+                // step 1.5b (O(n + pool·log pool); ties broken by unique id).
+                // `MIMIR_DENSE_SIG_ASYM=0` forces the old symmetric Hamming
+                // for A/B comparison.
+                let n = cache.ids.len();
+                let asym = !matches!(
+                    std::env::var("MIMIR_DENSE_SIG_ASYM")
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "0" | "false" | "off"
+                );
+                let sl = cache.sig_len.max(1);
+                let row_sig = |r: usize| &cache.sigs[r * sl..(r + 1) * sl];
+                if asym {
+                    let luts = build_asym_luts(query_vec, sl);
+                    let mut ranked: Vec<(f32, u32)> = (0..n)
+                        .map(|r| (asym_sig_score(&luts, row_sig(r)), r as u32))
+                        .collect();
+                    let cmp = |a: &(f32, u32), b: &(f32, u32)| {
+                        b.0.partial_cmp(&a.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| {
+                                cache.ids[a.1 as usize].cmp(&cache.ids[b.1 as usize])
+                            })
+                    };
+                    if ranked.len() > pool {
+                        ranked.select_nth_unstable_by(pool - 1, cmp);
+                        ranked.truncate(pool);
+                    }
+                    ranked.sort_by(cmp);
+                    ranked
+                        .into_iter()
+                        .map(|(_, i)| cache.ids[i as usize].clone())
+                        .collect()
+                } else {
+                    let mut ranked: Vec<(u32, u32)> = (0..n)
+                        .map(|r| (signature_hamming(&query_sig, row_sig(r)), r as u32))
+                        .collect();
+                    let cmp = |a: &(u32, u32), b: &(u32, u32)| {
+                        a.0.cmp(&b.0).then_with(|| {
+                            cache.ids[a.1 as usize].cmp(&cache.ids[b.1 as usize])
+                        })
+                    };
+                    if ranked.len() > pool {
+                        ranked.select_nth_unstable_by(pool - 1, cmp);
+                        ranked.truncate(pool);
+                    }
+                    ranked.sort_by(cmp);
+                    ranked
+                        .into_iter()
+                        .map(|(_, i)| cache.ids[i as usize].clone())
+                        .collect()
                 }
-                ranked.sort_by(cmp);
-                ranked
-                    .into_iter()
-                    .map(|(_, i)| cache.ids[i as usize].clone())
-                    .collect()
             } else {
                 // Covering-index scan (v18, #507) — see the count query's comment.
                 // Rows with an embedding but no signature no longer exist by the
@@ -11409,6 +11457,43 @@ pub(crate) fn embedding_signature(v: &[f32]) -> Vec<u8> {
     sig
 }
 
+/// #619 step 2a: per-byte-position lookup tables for ASYMMETRIC signature
+/// scoring. Symmetric Hamming compares `sign(q)` to `sign(v)`, discarding the
+/// query's magnitudes — exactly the information the full-precision query
+/// still holds. The asymmetric score ranks rows by `⟨q, sign(v)⟩` instead:
+/// `LUT[p][b] = Σ_{i<8} q[8p+i] · (bit i of b ? +1 : −1)` (bit order matches
+/// `embedding_signature`: bit i%8 of byte i/8), so a row scores in one
+/// lookup-add per signature byte. Query dims beyond `q.len()` contribute 0,
+/// so a dim-mismatched corpus degrades to garbage ranking that phase 2's
+/// exact-rerank dim check silently discards — the pre-existing behavior.
+fn build_asym_luts(query_vec: &[f32], sig_len: usize) -> Vec<[f32; 256]> {
+    let mut luts = vec![[0f32; 256]; sig_len];
+    for (p, lut) in luts.iter_mut().enumerate() {
+        // Build the 8 per-bit contributions once, then fill 256 entries.
+        let mut q8 = [0f32; 8];
+        for (i, q) in q8.iter_mut().enumerate() {
+            *q = query_vec.get(p * 8 + i).copied().unwrap_or(0.0);
+        }
+        for (b, slot) in lut.iter_mut().enumerate() {
+            let mut s = 0f32;
+            for (i, &qi) in q8.iter().enumerate() {
+                s += if (b >> i) & 1 == 1 { qi } else { -qi };
+            }
+            *slot = s;
+        }
+    }
+    luts
+}
+
+/// The asymmetric score of one signature under `build_asym_luts` tables:
+/// `⟨q, sign(v)⟩`, higher = closer.
+fn asym_sig_score(luts: &[[f32; 256]], sig: &[u8]) -> f32 {
+    sig.iter()
+        .zip(luts)
+        .map(|(&byte, lut)| lut[byte as usize])
+        .sum()
+}
+
 /// Hamming distance between two signatures. Length mismatch (different
 /// embedding dims) scores maximally distant so it can never win a slot.
 fn signature_hamming(a: &[u8], b: &[u8]) -> u32 {
@@ -17500,6 +17585,83 @@ mod tests {
         assert_eq!(
             after_reembed[0].0.id, "filler-00042",
             "in-place re-embed missed: SIG_WRITE_GEN stamp failed"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn asym_lut_score_equals_naive_signed_dot() {
+        // #619 step 2a: the per-byte LUT sum must equal the direct
+        // Σ q[i]·(bit i ? +1 : −1), including the ragged tail byte (dims
+        // beyond q.len() contribute 0).
+        let q: Vec<f32> = (0..19).map(|i| (i as f32 * 0.37).sin()).collect();
+        let v: Vec<f32> = (0..19).map(|i| (i as f32 * 0.91).cos()).collect();
+        let sig = embedding_signature(&v); // 3 bytes for 19 dims
+        let luts = build_asym_luts(&q, sig.len());
+        let got = asym_sig_score(&luts, &sig);
+        let want: f32 = (0..19)
+            .map(|i| if v[i] > 0.0 { q[i] } else { -q[i] })
+            .sum::<f32>()
+            // dims 19..24 of the padded 3rd byte: bits clear, q padded 0 → 0
+            + (19..24).map(|_| 0.0f32).sum::<f32>();
+        assert!((got - want).abs() < 1e-4, "LUT {got} != naive {want}");
+    }
+
+    #[test]
+    fn asym_scoring_rescues_true_neighbor_that_symmetric_hamming_exiles() {
+        // #619 step 2a, the failure mode this ships to fix: 2,500 decoys that
+        // are BIT-close to the query (Hamming 1 — only the dominant dim's
+        // sign differs) but truly far (cosine < 0), plus ONE true neighbor
+        // that is bit-far (Hamming 15 — every minor dim's sign differs) but
+        // truly near (cosine ≈ 1). Symmetric Hamming ranks the neighbor
+        // 2,501st — outside any pool ≤ 2,500, unrecoverable by the exact
+        // rerank. The asymmetric score ⟨q, sign(v)⟩ keeps the query's
+        // magnitudes: neighbor ≈ +0.85, decoys ≈ −0.85 — top of the pool.
+        let (db, path) = temp_db();
+        let conn = db.conn().unwrap();
+        let blob = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
+        let dim = 16usize;
+        let tx = conn.unchecked_transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO entities (id, category, key, body_json, type, status,
+                        retrieval_count, last_accessed_unix_ms, created_at_unix_ms,
+                        decay_score, layer, embedding, emb_sig, archived)
+                     VALUES (?1, 'insight', ?2, '{}', 'insight', 'active', 0, 0, 0,
+                             1.0, 'working', ?3, ?4, 0)",
+                )
+                .unwrap();
+            let mut decoy = vec![0.05f32; dim];
+            decoy[0] = -1.0;
+            for i in 1..=2500u32 {
+                stmt.execute(params![
+                    format!("decoy-{:05}", i),
+                    format!("decoy-key-{:05}", i),
+                    blob(&decoy),
+                    embedding_signature(&decoy)
+                ])
+                .unwrap();
+            }
+            let mut neighbor = vec![-0.01f32; dim];
+            neighbor[0] = 2.0;
+            stmt.execute(params![
+                "true-neighbor", "true-neighbor-key",
+                blob(&neighbor), embedding_signature(&neighbor)
+            ])
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let mut q = vec![0.01f32; dim];
+        q[0] = 1.0;
+        // Force the cache path; default scoring is asymmetric (step 2a).
+        let top = db.dense_search_with_opts(&q, 1, 100, Some(true)).unwrap();
+        assert_eq!(
+            top[0].0.id, "true-neighbor",
+            "asymmetric prefilter must surface the magnitude-dominant true \
+             neighbor that symmetric Hamming ranks dead last"
         );
 
         let _ = fs::remove_file(&path);

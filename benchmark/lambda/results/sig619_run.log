@@ -1,0 +1,290 @@
+=== ARM OFF (baseline, env unset) ===
+corpus: 1000000 entities in 10000 clusters x 100; 20000 queries
+skip-seed: reusing entities already in DB
+persisted entities (post-dedup): 995562
+embedding already complete (995562/995562); skipping serial embed
+stored embedding coverage: 995562
+warm-set: 9937/10000 clusters represented in 50000 scan; 19874 reachable queries
+
+[recall:uniform] n=2000 queries
+  fts5: @1=0.001 @5=0.001 @10=0.003  p50=57.2ms
+  dense: @1=0.262 @5=0.458 @10=0.532  p50=126.4ms
+  hybrid: @1=0.634 @5=1.0 @10=1.0  p50=375.4ms
+
+[recall:warm_set] n=2000 queries
+  fts5: @1=0.0 @5=0.003 @10=0.003  p50=58.1ms
+  dense: @1=0.248 @5=0.436 @10=0.512  p50=139.5ms
+  hybrid: @1=0.595 @5=1.0 @10=1.0  p50=377.0ms
+
+{
+  "seed": {
+    "skipped": true
+  },
+  "embedding": {
+    "mode": "binary-serial",
+    "entities_embedded": 0,
+    "secs": 0.0,
+    "entities_per_sec": 0.0,
+    "stored_coverage": 995562
+  },
+  "warm_set_info": {
+    "max_scan": 50000,
+    "clusters_in_scan": 9937,
+    "clusters_total": 10000
+  },
+  "recall@1": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.001,
+        "p50_ms": 57.2,
+        "p99_ms": 305.8
+      },
+      "dense": {
+        "recall": 0.262,
+        "p50_ms": 126.4,
+        "p99_ms": 131.2
+      },
+      "hybrid": {
+        "recall": 0.634,
+        "p50_ms": 375.4,
+        "p99_ms": 790.2
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.0,
+        "p50_ms": 58.1,
+        "p99_ms": 311.1
+      },
+      "dense": {
+        "recall": 0.248,
+        "p50_ms": 139.5,
+        "p99_ms": 144.8
+      },
+      "hybrid": {
+        "recall": 0.595,
+        "p50_ms": 377.0,
+        "p99_ms": 790.0
+      }
+    }
+  },
+  "recall@5": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.001,
+        "p50_ms": 57.2,
+        "p99_ms": 305.8
+      },
+      "dense": {
+        "recall": 0.458,
+        "p50_ms": 126.4,
+        "p99_ms": 131.2
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 375.4,
+        "p99_ms": 790.2
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 58.1,
+        "p99_ms": 311.1
+      },
+      "dense": {
+        "recall": 0.436,
+        "p50_ms": 139.5,
+        "p99_ms": 144.8
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 377.0,
+        "p99_ms": 790.0
+      }
+    }
+  },
+  "recall@10": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 57.2,
+        "p99_ms": 305.8
+      },
+      "dense": {
+        "recall": 0.532,
+        "p50_ms": 126.4,
+        "p99_ms": 131.2
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 375.4,
+        "p99_ms": 790.2
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 58.1,
+        "p99_ms": 311.1
+      },
+      "dense": {
+        "recall": 0.512,
+        "p50_ms": 139.5,
+        "p99_ms": 144.8
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 377.0,
+        "p99_ms": 790.0
+      }
+    }
+  }
+}
+
+written: /lambda/nfs/perseus-vault-fs-south/bench/scale1m_sigoff.json
+=== ARM ON (MIMIR_DENSE_SIG_CACHE=1) ===
+corpus: 1000000 entities in 10000 clusters x 100; 20000 queries
+skip-seed: reusing entities already in DB
+persisted entities (post-dedup): 995562
+embedding already complete (995562/995562); skipping serial embed
+stored embedding coverage: 995562
+warm-set: 9937/10000 clusters represented in 50000 scan; 19874 reachable queries
+
+[recall:uniform] n=2000 queries
+  fts5: @1=0.0 @5=0.001 @10=0.002  p50=57.1ms
+  dense: @1=0.449 @5=0.659 @10=0.74  p50=396.1ms
+  hybrid: @1=0.906 @5=1.0 @10=1.0  p50=459.2ms
+
+[recall:warm_set] n=2000 queries
+  fts5: @1=0.0 @5=0.003 @10=0.003  p50=58.5ms
+  dense: @1=0.451 @5=0.657 @10=0.729  p50=389.6ms
+  hybrid: @1=0.908 @5=1.0 @10=1.0  p50=459.4ms
+
+{
+  "seed": {
+    "skipped": true
+  },
+  "embedding": {
+    "mode": "binary-serial",
+    "entities_embedded": 0,
+    "secs": 0.0,
+    "entities_per_sec": 0.0,
+    "stored_coverage": 995562
+  },
+  "warm_set_info": {
+    "max_scan": 50000,
+    "clusters_in_scan": 9937,
+    "clusters_total": 10000
+  },
+  "recall@1": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.0,
+        "p50_ms": 57.1,
+        "p99_ms": 305.7
+      },
+      "dense": {
+        "recall": 0.449,
+        "p50_ms": 396.1,
+        "p99_ms": 408.4
+      },
+      "hybrid": {
+        "recall": 0.906,
+        "p50_ms": 459.2,
+        "p99_ms": 822.6
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.0,
+        "p50_ms": 58.5,
+        "p99_ms": 310.9
+      },
+      "dense": {
+        "recall": 0.451,
+        "p50_ms": 389.6,
+        "p99_ms": 403.1
+      },
+      "hybrid": {
+        "recall": 0.908,
+        "p50_ms": 459.4,
+        "p99_ms": 821.9
+      }
+    }
+  },
+  "recall@5": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.001,
+        "p50_ms": 57.1,
+        "p99_ms": 305.7
+      },
+      "dense": {
+        "recall": 0.659,
+        "p50_ms": 396.1,
+        "p99_ms": 408.4
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 459.2,
+        "p99_ms": 822.6
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 58.5,
+        "p99_ms": 310.9
+      },
+      "dense": {
+        "recall": 0.657,
+        "p50_ms": 389.6,
+        "p99_ms": 403.1
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 459.4,
+        "p99_ms": 821.9
+      }
+    }
+  },
+  "recall@10": {
+    "uniform": {
+      "fts5": {
+        "recall": 0.002,
+        "p50_ms": 57.1,
+        "p99_ms": 305.7
+      },
+      "dense": {
+        "recall": 0.74,
+        "p50_ms": 396.1,
+        "p99_ms": 408.4
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 459.2,
+        "p99_ms": 822.6
+      }
+    },
+    "warm_set": {
+      "fts5": {
+        "recall": 0.003,
+        "p50_ms": 58.5,
+        "p99_ms": 310.9
+      },
+      "dense": {
+        "recall": 0.729,
+        "p50_ms": 389.6,
+        "p99_ms": 403.1
+      },
+      "hybrid": {
+        "recall": 1.0,
+        "p50_ms": 459.4,
+        "p99_ms": 821.9
+      }
+    }
+  }
+}
+
+written: /lambda/nfs/perseus-vault-fs-south/bench/scale1m_sigon.json

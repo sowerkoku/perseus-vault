@@ -6,6 +6,21 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- **Keystones — mandatory policy rules** (#683). A new `keystones` table
+  (schema v21) plus `mimir_keystone_set` / `mimir_keystone_get` MCP tools.
+  Keystones are directives fetched deterministically at session start (unlike
+  ordinary memories, which are retrieved when relevant), merged across scope
+  (tenant < fleet < agent) with weight-based conflict resolution, and meant to
+  be obeyed over any conflicting instruction. Re-setting the same
+  (scope, scope_id, content) updates in place; every mutation is appended to
+  the cryptographic audit chain (`event_type=keystone_set`). Authoring is
+  trust-tier-gated (`trust_tier_required`, default 2) — caller-asserted via
+  `author_trust_tier` until per-agent trust + session identity land (#684), at
+  which point enforcement becomes automatic (the response's `trust_enforced`
+  flag surfaces which mode applied). The session-start `@keystone` render
+  directive that injects merged keystones ahead of all other context lives in
+  the separate Perseus orchestrator; this ships the vault-side storage, query,
+  and audit surface it renders from.
 - **Temporal RAG: history-inclusive point-in-time recall** (#682). Temporal
   semantic recall (`as_of` / `valid_at`) could only reconstruct facts whose
   *current* body still matched the query, because candidates came from the live
@@ -24,6 +39,17 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   are appended only to fill the caller's limit, and a query that already found
   enough is a no-op. The hot `db::recall` core is untouched (no determinism or
   benchmark impact).
+- **Outcome-weighted recall ranking** (#681). The honest follow-rate efficacy
+  signal (`mimir_follow`) now feeds recall ranking, not just decay: a memory
+  that gets FOLLOWED is boosted (`1.0 + follow_rate * 0.3`, mirroring the decay
+  composite so the two never drift) and a 'dead' lesson (ignored despite
+  ≥ 5 attempts) is gently demoted (×0.5 — not the decay path's near-annihilating
+  ×0.05, so ranking never fully buries an otherwise-relevant hit). Folded into
+  the existing #487 usefulness rank pass (one primary-key lookup) and applied
+  over the fused candidate pool before truncation. On by default, bounded, and
+  a strict no-op on any memory without a follow/miss signal — so freshly
+  ingested corpora and every benchmark rank exactly as before. Kill-switch:
+  `PERSEUS_VAULT_OUTCOME_RANK=0`. Determinism (#247) preserved.
 - **`mimir_scan` — deterministic paginated enumeration** (#562). First-class
   "list all / export / sync / reset" path: pages a category (or the whole store)
   by immutable `id ASC` with a keyset continuation cursor (`next_cursor` /

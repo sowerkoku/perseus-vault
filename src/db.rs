@@ -5674,6 +5674,168 @@ impl Database {
         self.encryption.as_ref().map(|e| *e.audit_key())
     }
 
+    /// #683: author or update a Keystone (mandatory policy rule). Upsert by
+    /// (scope, scope_id, content, workspace_hash) so re-setting the same rule
+    /// updates its weight / required tier / author in place instead of
+    /// duplicating. `scope` must be one of tenant | fleet | agent. Every
+    /// mutation is appended to the cryptographic audit chain (event_type
+    /// `keystone_set`, category `keystone`). Returns `(id, created)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn keystone_set(
+        &self,
+        content: &str,
+        scope: &str,
+        scope_id: &str,
+        weight: f64,
+        trust_tier_required: i64,
+        workspace_hash: &str,
+        author_agent_id: &str,
+    ) -> Result<(String, bool), Box<dyn std::error::Error>> {
+        if !matches!(scope, "tenant" | "fleet" | "agent") {
+            return Err(format!(
+                "invalid keystone scope '{scope}': expected 'tenant', 'fleet', or 'agent'"
+            )
+            .into());
+        }
+        if content.trim().is_empty() {
+            return Err("keystone content must not be empty".into());
+        }
+        let now = now_ms();
+        let conn = self.conn()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM keystones \
+                 WHERE scope = ?1 AND scope_id = ?2 AND content = ?3 AND workspace_hash = ?4",
+                params![scope, scope_id, content, workspace_hash],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        let (id, created) = match existing {
+            Some(id) => {
+                conn.execute(
+                    "UPDATE keystones SET weight = ?1, trust_tier_required = ?2, \
+                     author_agent_id = ?3, updated_at_unix_ms = ?4 WHERE id = ?5",
+                    params![weight, trust_tier_required, author_agent_id, now, id],
+                )?;
+                (id, false)
+            }
+            None => {
+                let id = format!(
+                    "ks-{}",
+                    uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+                );
+                conn.execute(
+                    "INSERT INTO keystones \
+                     (id, content, scope, scope_id, weight, trust_tier_required, \
+                      workspace_hash, author_agent_id, created_at_unix_ms, updated_at_unix_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                    params![
+                        id,
+                        content,
+                        scope,
+                        scope_id,
+                        weight,
+                        trust_tier_required,
+                        workspace_hash,
+                        author_agent_id,
+                        now
+                    ],
+                )?;
+                (id, true)
+            }
+        };
+        // Crypto-chained audit event, like entity mutations.
+        self.journal(&crate::models::JournalEvent {
+            id: format!(
+                "jrn-{}",
+                uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+            ),
+            event_type: "keystone_set".to_string(),
+            evaluated_json: serde_json::json!({
+                "scope": scope,
+                "scope_id": scope_id,
+                "weight": weight,
+                "trust_tier_required": trust_tier_required,
+                "created": created,
+            })
+            .to_string(),
+            acted_json: String::new(),
+            forward_json: String::new(),
+            category: "keystone".to_string(),
+            key: id.clone(),
+            entity_id: id.clone(),
+            agent_id: author_agent_id.to_string(),
+            workspace_hash: workspace_hash.to_string(),
+            created_at_unix_ms: now,
+        })?;
+        Ok((id, created))
+    }
+
+    /// #683: the merged Keystones that apply for a scope filter, ordered for
+    /// deterministic precedence: weight DESC, then scope (tenant < fleet <
+    /// agent), then id. A renderer injects these ahead of all other context.
+    /// Filters are widening: an omitted `scope`/`scope_id` matches all; a
+    /// provided `workspace_hash` includes both that workspace and global (`''`)
+    /// keystones; a provided `scope_id` includes both it and scope-wide (`''`).
+    pub fn keystone_get(
+        &self,
+        scope: Option<&str>,
+        scope_id: Option<&str>,
+        workspace_hash: Option<&str>,
+    ) -> Result<Vec<crate::models::Keystone>, Box<dyn std::error::Error>> {
+        let conn = self.conn()?;
+        let mut conds: Vec<String> = Vec::new();
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(s) = scope.filter(|s| !s.is_empty()) {
+            conds.push(format!("scope = ?{}", binds.len() + 1));
+            binds.push(Box::new(s.to_string()));
+        }
+        if let Some(sid) = scope_id.filter(|s| !s.is_empty()) {
+            conds.push(format!(
+                "(scope_id = ?{} OR scope_id = '')",
+                binds.len() + 1
+            ));
+            binds.push(Box::new(sid.to_string()));
+        }
+        if let Some(ws) = workspace_hash.filter(|w| !w.is_empty()) {
+            conds.push(format!(
+                "(workspace_hash = ?{} OR workspace_hash = '')",
+                binds.len() + 1
+            ));
+            binds.push(Box::new(ws.to_string()));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT id, content, scope, scope_id, weight, trust_tier_required, \
+                    workspace_hash, author_agent_id, created_at_unix_ms, updated_at_unix_ms \
+             FROM keystones {where_clause} \
+             ORDER BY weight DESC, \
+               CASE scope WHEN 'tenant' THEN 0 WHEN 'fleet' THEN 1 WHEN 'agent' THEN 2 ELSE 3 END ASC, \
+               id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |r| {
+            Ok(crate::models::Keystone {
+                id: r.get(0)?,
+                content: r.get(1)?,
+                scope: r.get(2)?,
+                scope_id: r.get(3)?,
+                weight: r.get(4)?,
+                trust_tier_required: r.get(5)?,
+                workspace_hash: r.get(6)?,
+                author_agent_id: r.get(7)?,
+                created_at_unix_ms: r.get(8)?,
+                updated_at_unix_ms: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// All superseded (historical) versions of a (category, key), newest first.
     /// Each was the live fact during [recorded_at_unix_ms, invalidated_at_unix_ms);
     /// the current live version lives in `entities`, not here. Bodies are decrypted

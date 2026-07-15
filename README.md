@@ -366,6 +366,12 @@ Any MCP-compatible framework works with Perseus Vault directly. See
 | `mimir_supersede` | Mark a new fact as superseding an old one (sets the old entity to `deprecated`). |
 | `mimir_follow` | Record whether an entity was actually FOLLOWED or MISSED — follow-rate efficacy signal that feeds both decay scoring and outcome-weighted recall ranking (#681). |
 
+### Keystones (policy rules)
+| Tool | Description |
+|---|---|
+| `mimir_keystone_set` | Author a Keystone — a mandatory policy rule that survives context compaction (#683). Scoped (tenant/fleet/agent), weight-ranked, crypto-chained on every mutation; authoring is trust-tier-gated. |
+| `mimir_keystone_get` | Fetch the merged Keystones for a scope, ordered by weight (highest first) then scope specificity — the deterministic session-start counterpart to recall. A renderer injects these ahead of all other context. |
+
 ### Vault & Federation
 | Tool | Description |
 |---|---|

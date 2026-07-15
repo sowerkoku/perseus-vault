@@ -21,6 +21,24 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
   directive that injects merged keystones ahead of all other context lives in
   the separate Perseus orchestrator; this ships the vault-side storage, query,
   and audit surface it renders from.
+- **Temporal RAG: history-inclusive point-in-time recall** (#682). Temporal
+  semantic recall (`as_of` / `valid_at`) could only reconstruct facts whose
+  *current* body still matched the query, because candidates came from the live
+  FTS/dense index — a fact whose query-matching version had since been
+  superseded or retired (its text now living only in `entity_history`) could
+  never surface (the documented v1 limitation). A new standalone
+  `entity_history_fts` index (schema v20) makes superseded/retired body text
+  searchable; on a temporal recall, `augment_temporal_with_history` discovers
+  the keys the live index missed and reconstructs each through the **same**
+  authoritative `bitemporal_at` / `as_of_version` engines, so temporal semantics
+  are identical to the point-lookup tools. The index stores plaintext
+  (decrypt-aware, mirroring `entities_fts`; never indexes ciphertext),
+  maintained at the history-append site and cleared at both history-delete
+  sites; pre-existing history is backfilled by `mimir_reindex`. Purely
+  additive: live/relevance-ranked hits keep their positions, history-only hits
+  are appended only to fill the caller's limit, and a query that already found
+  enough is a no-op. The hot `db::recall` core is untouched (no determinism or
+  benchmark impact).
 - **Outcome-weighted recall ranking** (#681). The honest follow-rate efficacy
   signal (`mimir_follow`) now feeds recall ranking, not just decay: a memory
   that gets FOLLOWED is boosted (`1.0 + follow_rate * 0.3`, mirroring the decay

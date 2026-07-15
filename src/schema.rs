@@ -192,6 +192,17 @@ CREATE TABLE IF NOT EXISTS entity_history (
 CREATE INDEX IF NOT EXISTS idx_entity_history_id ON entity_history(id);
 CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category, key, invalidated_at_unix_ms);
 
+-- #682 Temporal RAG: a standalone FTS5 index over superseded/retired body text.
+-- entities_fts only covers LIVE rows, so a point-in-time semantic query could
+-- never surface a fact whose query-matching version had since been superseded
+-- (its text now lives only in entity_history) — the documented v1 limitation.
+-- This index is queried ONLY when a temporal filter is active, purely to
+-- discover (category,key) candidates the live index missed; the authoritative
+-- point-in-time reconstruction still runs through bitemporal_at/as_of. Rowids
+-- mirror entity_history.rowid, maintained at the single history-append site and
+-- cleared at the two history-delete sites (purge/forget) to avoid rowid reuse.
+CREATE VIRTUAL TABLE IF NOT EXISTS entity_history_fts USING fts5(body_json);
+
 -- #683 Keystones: mandatory policy rules, fetched deterministically at session
 -- start (mimir_keystone_get) and obeyed over conflicting instructions. Merged
 -- across scope (tenant < fleet < agent) with weight-based conflict resolution.
@@ -254,10 +265,12 @@ CREATE INDEX IF NOT EXISTS idx_keystones_scope
 /// coarse prefilter and the exact rerank, plus its covering index. Backfilled
 /// from stored vectors at migration; writers maintain the column alongside
 /// embedding/emb_sig.
+/// v20 (#682 Temporal RAG): `entity_history_fts` — standalone FTS5 over
+/// superseded/retired body text, so point-in-time semantic recall can surface
+/// facts whose query-matching version has since left the live index. Created
+/// idempotently and backfilled from every existing entity_history row.
 /// v21 (#683 Keystones): the `keystones` table (mandatory policy rules).
-/// Created idempotently; no backfill (new table). NOTE: v20 is #682's
-/// `entity_history_fts` — this PR is developed in parallel; whichever lands
-/// second keeps both migration blocks and the higher version number.
+/// Created idempotently; no backfill (new table).
 const SCHEMA_VERSION: i64 = 21;
 
 /// Initialize the v0.2.0 schema on a fresh database.
@@ -747,11 +760,24 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
     )?;
     // ── end v19 ──────────────────────────────────────────────────────────
 
+    // ── v20 (#682 Temporal RAG): searchable history ──────────────────────
+    // Standalone FTS5 over entity_history body text. Create idempotently only
+    // (the base DDL also has this IF NOT EXISTS create for fresh DBs). The
+    // index stores PLAINTEXT, so it is NOT backfilled here with a raw
+    // INSERT…SELECT: under encryption `entity_history.body_json` is ciphertext,
+    // and this migration has no key. New/superseded facts are indexed
+    // (decrypt-aware) at the write sites going forward; pre-existing history is
+    // (re)indexed by `reindex_fts` (the `mimir_reindex` tool), which owns the
+    // dual encrypted/plaintext path. Fresh installs have empty history, so this
+    // is a no-op backfill for them regardless.
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS entity_history_fts USING fts5(body_json);",
+    )?;
+    // ── end v20 ──────────────────────────────────────────────────────────
+
     // ── v21 (#683 Keystones): mandatory policy rules table ───────────────
     // New table (the base DDL also has this IF NOT EXISTS create for fresh
-    // DBs). No backfill — there is nothing to migrate. (v20 = #682's
-    // entity_history_fts, developed in parallel; kept distinct so the two can
-    // land in either order.)
+    // DBs). No backfill — there is nothing to migrate.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS keystones (
             id TEXT PRIMARY KEY,

@@ -1,0 +1,25 @@
+{
+  "benchmark": "perseus-vault-fp32-vs-int8",
+  "issue": "#630",
+  "corpus": {
+    "n_entities": 2000,
+    "n_probes": 100
+  },
+  "models": {
+    "int8": "all-MiniLM-L6-v2 qint8 (bundled, 23MB)",
+    "fp32": "all-MiniLM-L6-v2 FP32 (HuggingFace, 86MB)"
+  },
+  "self_consistency": {
+    "mean_cosine": 0.988738477230072,
+    "min_cosine": 0.9798107147216797,
+    "median_cosine": 0.9890207648277283
+  },
+  "nn_agreement": {
+    "top_1": 0.71,
+    "top_5": 0.762,
+    "top_10": 0.8,
+    "top_20": 0.815,
+    "top_50": 0.835,
+    "top_100": 0.8516
+  }
+}

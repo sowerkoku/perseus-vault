@@ -6,17 +6,24 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
-- **Outcome-weighted recall ranking** (#681). The honest follow-rate efficacy
-  signal (`mimir_follow`) now feeds recall ranking, not just decay: a memory
-  that gets FOLLOWED is boosted (`1.0 + follow_rate * 0.3`, mirroring the decay
-  composite so the two never drift) and a 'dead' lesson (ignored despite
-  ≥ 5 attempts) is gently demoted (×0.5 — not the decay path's near-annihilating
-  ×0.05, so ranking never fully buries an otherwise-relevant hit). Folded into
-  the existing #487 usefulness rank pass (one primary-key lookup) and applied
-  over the fused candidate pool before truncation. On by default, bounded, and
-  a strict no-op on any memory without a follow/miss signal — so freshly
-  ingested corpora and every benchmark rank exactly as before. Kill-switch:
-  `PERSEUS_VAULT_OUTCOME_RANK=0`. Determinism (#247) preserved.
+- **Temporal RAG: history-inclusive point-in-time recall** (#682). Temporal
+  semantic recall (`as_of` / `valid_at`) could only reconstruct facts whose
+  *current* body still matched the query, because candidates came from the live
+  FTS/dense index — a fact whose query-matching version had since been
+  superseded or retired (its text now living only in `entity_history`) could
+  never surface (the documented v1 limitation). A new standalone
+  `entity_history_fts` index (schema v20) makes superseded/retired body text
+  searchable; on a temporal recall, `augment_temporal_with_history` discovers
+  the keys the live index missed and reconstructs each through the **same**
+  authoritative `bitemporal_at` / `as_of_version` engines, so temporal semantics
+  are identical to the point-lookup tools. The index stores plaintext
+  (decrypt-aware, mirroring `entities_fts`; never indexes ciphertext),
+  maintained at the history-append site and cleared at both history-delete
+  sites; pre-existing history is backfilled by `mimir_reindex`. Purely
+  additive: live/relevance-ranked hits keep their positions, history-only hits
+  are appended only to fill the caller's limit, and a query that already found
+  enough is a no-op. The hot `db::recall` core is untouched (no determinism or
+  benchmark impact).
 - **`mimir_scan` — deterministic paginated enumeration** (#562). First-class
   "list all / export / sync / reset" path: pages a category (or the whole store)
   by immutable `id ASC` with a keyset continuation cursor (`next_cursor` /

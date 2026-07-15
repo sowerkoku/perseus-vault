@@ -1883,6 +1883,41 @@ impl Database {
                 [],
             )?
         };
+        // #682: rebuild the standalone history FTS from every entity_history row
+        // in the same transaction. This is the backfill path for stores upgraded
+        // to schema v20 (the migration only creates the empty table), and the
+        // repair path if the index ever drifts. Same dual encrypted/plaintext
+        // handling as the live index above — never index ciphertext.
+        tx.execute("DELETE FROM entity_history_fts", [])?;
+        if let Some(ref enc) = self.encryption {
+            let rows: Vec<(i64, String, String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT rowid, category, key, body_json FROM entity_history",
+                )?;
+                let mapped = stmt.query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut insert =
+                tx.prepare("INSERT INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)")?;
+            for (rowid, category, key, raw_body) in rows {
+                let plain = match Self::decrypt_body_with_aad_fallback(
+                    enc, &raw_body, &category, &key,
+                ) {
+                    crate::encryption::BodyDecrypt::Plaintext(s)
+                    | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                    crate::encryption::BodyDecrypt::AuthFailed(_) => "{}".to_string(),
+                };
+                insert.execute(params![rowid, plain])?;
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO entity_history_fts (rowid, body_json)
+                 SELECT rowid, body_json FROM entity_history",
+                [],
+            )?;
+        }
         tx.commit()?;
         Ok(indexed)
     }
@@ -3635,7 +3670,7 @@ impl Database {
             // re-assert (#371) — same body, but the pre-change valid period
             // must stay reconstructable.
             if content_changed || audit_period_change {
-                Self::snapshot_live_row_to_history(&tx, &history_id, now, &id)?;
+                Self::snapshot_live_row_to_history(&tx, self.encryption.as_ref(), &history_id, now, &id)?;
             }
 
             // #382: remember must not clobber the stored link graph. Callers
@@ -5903,6 +5938,82 @@ impl Database {
             .next())
     }
 
+    /// #682 Temporal RAG: candidate `(category, key)` pairs whose SUPERSEDED or
+    /// retired body text matches `query`, discovered via the standalone history
+    /// FTS (`entity_history_fts`). Temporal semantic recall over the LIVE index
+    /// surfaces a fact only if its CURRENT body still matches; this finds keys
+    /// the live index missed — a fact whose matching version has since been
+    /// replaced (e.g. "CEO is Alice", now "Bob") or a key fully retired since
+    /// the instant. It returns ONLY keys: the authoritative point-in-time
+    /// reconstruction still runs through `bitemporal_at` / `as_of_version`, so
+    /// temporal semantics are identical to the point-lookup tools. Query
+    /// tokenization mirrors `fts5_bm25_search` (stopword drop, quote-escape,
+    /// prefix `OR`). Distinct keys, workspace-scoped like recall's widening
+    /// (current workspace + global `''`), most-recent transaction time first,
+    /// capped at `limit`.
+    pub fn history_matching_keys(
+        &self,
+        query: &str,
+        workspace_hash: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let words: Vec<&str> = query
+            .split_whitespace()
+            .filter(|w| !w.is_empty() && !is_stopword(w))
+            .collect();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query = words
+            .iter()
+            .map(|w| {
+                let escaped = w.replace('"', "\"\"");
+                if escaped.is_empty() {
+                    "\"\"".to_string()
+                } else {
+                    format!("\"{}\"*", escaped)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let conn = self.conn()?;
+        let scoped = matches!(workspace_hash, Some(ws) if !ws.is_empty());
+        let sql = format!(
+            "SELECT h.category, h.key, \
+                    MAX(COALESCE(h.recorded_at_unix_ms, h.created_at_unix_ms)) AS rec \
+             FROM entity_history_fts JOIN entity_history h \
+               ON h.rowid = entity_history_fts.rowid \
+             WHERE entity_history_fts MATCH ?1{} \
+             GROUP BY h.category, h.key \
+             ORDER BY rec DESC, h.category ASC, h.key ASC \
+             LIMIT ?{}",
+            if scoped {
+                " AND (h.workspace_hash = ?2 OR h.workspace_hash = '')"
+            } else {
+                ""
+            },
+            if scoped { 3 } else { 2 }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let map_row =
+            |r: &rusqlite::Row| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
+        let rows: Vec<(String, String)> = if scoped {
+            stmt.query_map(
+                params![fts_query, workspace_hash.unwrap(), limit as i64],
+                map_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![fts_query, limit as i64], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows)
+    }
+
     /// #472 Temporal RAG: reconstruct a recalled entity set to its point-in-time
     /// versions in place — transaction-time `as_of` and/or world-time `valid_at`.
     /// Each body is swapped for the version live at that instant; entities with
@@ -6537,7 +6648,7 @@ impl Database {
             "hist-{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
         );
-        Self::snapshot_live_row_to_history(&tx, &history_id, now, id)?;
+        Self::snapshot_live_row_to_history(&tx, self.encryption.as_ref(), &history_id, now, id)?;
         tx.execute(
             "UPDATE entities SET status = ?1, archive_reason = ?2, last_accessed_unix_ms = ?3,
                 recorded_at_unix_ms = ?4, supersedes = ?5,
@@ -6583,6 +6694,7 @@ impl Database {
     /// of the live row.
     fn snapshot_live_row_to_history(
         conn: &rusqlite::Connection,
+        enc: Option<&EncryptionManager>,
         history_id: &str,
         invalidated_at: i64,
         id: &str,
@@ -6603,6 +6715,48 @@ impl Database {
               supersedes, ?3, created_at_unix_ms, last_accessed_unix_ms
              FROM entities WHERE id = ?3",
             params![history_id, invalidated_at, id],
+        )?;
+        // #682: index this snapshot's PLAINTEXT body into the standalone history
+        // FTS (rowid = entity_history.rowid), so point-in-time semantic recall
+        // can later surface this now-superseded version by its own text — even
+        // if the live row's text has since changed to no longer match. Mirrors
+        // reindex_fts's dual path: under encryption `body_json` is ciphertext, so
+        // decrypt (build_aad with legacy fallback) before indexing; on auth
+        // failure index an empty body rather than leak/garble ciphertext.
+        Self::index_history_row_fts(conn, enc, history_id)?;
+        Ok(())
+    }
+
+    /// #682: (re)index a single `entity_history` row's plaintext body into
+    /// `entity_history_fts` at the matching rowid. Idempotent via
+    /// `INSERT OR REPLACE`. Safe no-op if the history row is gone.
+    fn index_history_row_fts(
+        conn: &rusqlite::Connection,
+        enc: Option<&EncryptionManager>,
+        history_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let row: Option<(i64, String, String, String)> = conn
+            .query_row(
+                "SELECT rowid, category, key, body_json FROM entity_history WHERE history_id = ?1",
+                params![history_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((rowid, category, key, raw_body)) = row else {
+            return Ok(());
+        };
+        let plain = match enc {
+            Some(enc) => match Self::decrypt_body_with_aad_fallback(enc, &raw_body, &category, &key)
+            {
+                crate::encryption::BodyDecrypt::Plaintext(s)
+                | crate::encryption::BodyDecrypt::LegacyPlaintext(s) => s,
+                crate::encryption::BodyDecrypt::AuthFailed(_) => "{}".to_string(),
+            },
+            None => raw_body,
+        };
+        conn.execute(
+            "INSERT OR REPLACE INTO entity_history_fts (rowid, body_json) VALUES (?1, ?2)",
+            params![rowid, plain],
         )?;
         Ok(())
     }
@@ -6669,7 +6823,7 @@ impl Database {
             "hist-{}",
             uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
         );
-        Self::snapshot_live_row_to_history(&tx, &history_id, now, id)?;
+        Self::snapshot_live_row_to_history(&tx, self.encryption.as_ref(), &history_id, now, id)?;
         tx.execute(
             "UPDATE entities SET valid_to_unix_ms = ?1, recorded_at_unix_ms = ?2,
                 supersedes = ?3, valid_from_unix_ms = COALESCE(valid_from_unix_ms, ?4)
@@ -8504,6 +8658,16 @@ Return a JSON object with an "insights" array. Each insight has:
         let mut history_deleted = 0i64;
         let mut journal_redacted = 0i64;
         for (id, cat, key, ws) in &doomed {
+            // #682: drop the history rows' FTS entries first (by rowid), so the
+            // standalone entity_history_fts can't retain orphaned text or, worse,
+            // hand a reused rowid to a future snapshot as a false match.
+            conn.execute(
+                &format!(
+                    "DELETE FROM entity_history_fts WHERE rowid IN \
+                     (SELECT rowid FROM entity_history WHERE {HIST_MATCH})"
+                ),
+                params![id, cat, key, ws],
+            )?;
             history_deleted += conn.execute(
                 &format!("DELETE FROM entity_history WHERE {HIST_MATCH}"),
                 params![id, cat, key, ws],
@@ -8767,6 +8931,14 @@ Return a JSON object with an "insights" array. Each insight has:
                     digest =
                         history_retention_digest(&digest, &r.history_id, &body, r.rec, r.inv);
                 }
+                // #682: clear this version's history-FTS entry (by rowid)
+                // before deleting the row, so the standalone index never
+                // retains orphaned text or a reusable rowid.
+                tx.execute(
+                    "DELETE FROM entity_history_fts WHERE rowid IN \
+                     (SELECT rowid FROM entity_history WHERE history_id = ?1)",
+                    params![r.history_id],
+                )?;
                 tx.execute(
                     "DELETE FROM entity_history WHERE history_id = ?1",
                     params![r.history_id],
@@ -22786,6 +22958,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamped, 0, "nothing may be stamped on any row");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_fts_finds_superseded_body_that_live_index_cannot() {
+        // #682: once a fact is superseded, its old body moves to entity_history
+        // and leaves the live FTS index. A query matching only that old body
+        // must still be discoverable via the history FTS (the seam that lets
+        // temporal recall surface it), even though live recall finds nothing.
+        let (db, path) = temp_db();
+        db.remember(&make_entity(
+            "e-ldr",
+            "org",
+            "leader",
+            r#"{"note":"the leader is Alice Alpha"}"#,
+        ))
+        .unwrap();
+        // Supersede with a body sharing no meaning-bearing tokens with the old.
+        db.remember(&make_entity(
+            "e-ldr2",
+            "org",
+            "leader",
+            r#"{"note":"the leader is Bob Bravo"}"#,
+        ))
+        .unwrap();
+
+        // The old, superseded body is discoverable in history…
+        let hits = db.history_matching_keys("Alpha", None, 10).unwrap();
+        assert_eq!(
+            hits,
+            vec![("org".to_string(), "leader".to_string())],
+            "superseded 'Alpha' body must be found via history FTS"
+        );
+        // …the current live body is NOT in history (never superseded)…
+        assert!(
+            db.history_matching_keys("Bravo", None, 10).unwrap().is_empty(),
+            "the live body must not appear in the history index"
+        );
+        // …and the live index genuinely cannot serve the old term (the gap).
+        let live = db
+            .recall(&RecallParams {
+                query: "Alpha".to_string(),
+                mode: crate::models::SearchMode::Fts5,
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            live.is_empty(),
+            "live FTS must not match the superseded term — that is the #682 gap"
+        );
         let _ = fs::remove_file(&path);
     }
 

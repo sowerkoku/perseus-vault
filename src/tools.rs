@@ -340,9 +340,12 @@ struct TemporalHit {
 ///     reconstructs the historical world-version rather than narrowing live rows.
 ///   * `as_of` only → the version believed at transaction time `as_of`.
 /// At least one of `as_of` / `valid_at` must be Some (the caller guarantees it).
-/// Candidate generation is still over the live index, so a fact fully deleted
-/// since the instant (history-only, unindexed) will not surface — the documented
-/// v1 limitation; the dominant "reproduce a still-known fact at T" case is exact.
+/// Candidate generation here is over the live index, so this pass alone cannot
+/// surface a fact whose query-matching version has since been superseded/retired
+/// (history-only). #682 closes that: `augment_temporal_with_history` runs right
+/// after this and reconstructs the missed keys via the same engines. This
+/// function stays live-only so the fast, common "reproduce a still-known fact at
+/// T" path is untouched.
 fn temporal_resolve(
     db: &Database,
     as_of: Option<i64>,
@@ -373,6 +376,69 @@ fn temporal_resolve(
     }
     *entities = resolved;
     Ok(hits)
+}
+
+/// #682 Temporal RAG: history-inclusive candidate generation. `temporal_resolve`
+/// above can only reconstruct facts whose CURRENT body still matches the query
+/// (candidates came from the live index). A fact whose query-matching version
+/// has since been superseded/retired lives only in `entity_history`, so it never
+/// surfaced — the documented v1 limitation. This fills that gap: discover the
+/// missed keys via the history FTS and reconstruct each through the SAME
+/// point-in-time engines (`bitemporal_at` / `as_of_version`) as `temporal_resolve`,
+/// so semantics are identical. It only ever ADDS — live/relevance-ranked hits
+/// keep their positions and history-only hits are appended, and only up to the
+/// caller's `limit` (so a query that already found enough is untouched: the
+/// augmentation is a no-op whenever `entities.len() >= limit`). `hits` is kept
+/// 1:1 with `entities` so downstream provenance stamping stays aligned.
+fn augment_temporal_with_history(
+    db: &Database,
+    query: &str,
+    as_of: Option<i64>,
+    valid_at: Option<i64>,
+    workspace_hash: Option<&str>,
+    limit: usize,
+    entities: &mut Vec<crate::models::Entity>,
+    hits: &mut Vec<TemporalHit>,
+) -> Result<(), String> {
+    if limit == 0 || entities.len() >= limit {
+        return Ok(());
+    }
+    let mut seen: std::collections::HashSet<(String, String)> = entities
+        .iter()
+        .map(|e| (e.category.clone(), e.key.clone()))
+        .collect();
+    // Discover a modest pool beyond what's already surfaced; bounded.
+    let discover = limit.saturating_mul(2).clamp(1, 200);
+    let keys = db
+        .history_matching_keys(query, workspace_hash, discover)
+        .map_err(|e| format!("temporal history discovery failed: {}", e))?;
+    for (category, key) in keys {
+        if entities.len() >= limit {
+            break;
+        }
+        if !seen.insert((category.clone(), key.clone())) {
+            continue;
+        }
+        let tv = match valid_at {
+            Some(v) => db.bitemporal_at(&category, &key, as_of.unwrap_or(i64::MAX), v),
+            None => db.as_of_version(
+                &category,
+                &key,
+                as_of.expect("augment_temporal_with_history requires as_of or valid_at"),
+            ),
+        }
+        .map_err(|e| format!("temporal history resolution failed: {}", e))?;
+        if let Some(tv) = tv {
+            hits.push(TemporalHit {
+                is_live: tv.invalidated_at_unix_ms.is_none(),
+                recorded_at: tv.recorded_at_unix_ms,
+                valid_from: tv.valid_from_unix_ms,
+                valid_to: tv.valid_to_unix_ms,
+            });
+            entities.push(tv.entity);
+        }
+    }
+    Ok(())
 }
 
 /// #287: presentation-layer confidence rollup over signals Mneme already has.
@@ -984,7 +1050,22 @@ pub fn handle_recall(db: &Database, args: Value) -> Result<String, String> {
     // transaction axis; together = the full bi-temporal cell. The valid_from/
     // valid_to PERIOD-range filter (when no valid_at instant) stays a live narrow.
     let temporal_meta = if as_of.is_some() || valid_at.is_some() {
-        Some(temporal_resolve(db, as_of, valid_at, &mut entities)?)
+        let mut hits = temporal_resolve(db, as_of, valid_at, &mut entities)?;
+        // #682: close the documented v1 limitation — surface facts whose
+        // query-matching version has since been superseded/retired (live index
+        // never saw them). Only fills up to the caller's limit and only when
+        // the live path came up short, so it never reorders or bloats results.
+        augment_temporal_with_history(
+            db,
+            &params.query,
+            as_of,
+            valid_at,
+            params.workspace_hash.as_deref(),
+            requested_limit.max(0) as usize,
+            &mut entities,
+            &mut hits,
+        )?;
+        Some(hits)
     } else {
         valid_time_retain(db, None, valid_from, valid_to, &valid_op, &mut entities)?;
         None
@@ -6177,6 +6258,63 @@ mod tests {
             "surviving entity must still be reinforced once per recall"
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn temporal_recall_surfaces_superseded_fact_via_history() {
+        // #682 end-to-end: a fact valid at T whose body has since been
+        // superseded must surface under a temporal recall keyed on its OWN
+        // (now-historical) text — the case plain live-index recall cannot serve.
+        let (db, path) = temp_db();
+        handle_remember(
+            &db,
+            json!({"category": "org", "key": "leader",
+                   "body_json": "{\"note\":\"the leader is Alice Alpha\"}"}),
+        )
+        .expect("v1");
+        // Distinct transaction time so Alice's [recorded, invalidated) window is
+        // non-empty (as_of below lands strictly inside it).
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        handle_remember(
+            &db,
+            json!({"category": "org", "key": "leader",
+                   "body_json": "{\"note\":\"the leader is Bob Bravo\"}"}),
+        )
+        .expect("v2 supersede");
+
+        // Plain (non-temporal) recall on the superseded term finds nothing —
+        // the live body is now "Bob Bravo".
+        let live = handle_recall(&db, json!({"query": "Alpha", "mode": "fts5"})).expect("live");
+        let lv: Value = serde_json::from_str(&live).unwrap();
+        assert_eq!(lv["total"], json!(0), "live recall must miss the old term: {live}");
+
+        // Alice's transaction window, read straight from history.
+        let (rec, inv): (i64, i64) = {
+            let conn = db.conn().unwrap();
+            conn.query_row(
+                "SELECT COALESCE(recorded_at_unix_ms, created_at_unix_ms), invalidated_at_unix_ms \
+                 FROM entity_history WHERE category='org' AND key='leader'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert!(rec < inv, "sleep must yield a non-empty tx window ({rec} < {inv})");
+
+        // Temporal recall AS OF that window surfaces the superseded Alice body.
+        let r = handle_recall(
+            &db,
+            json!({"query": "Alpha", "mode": "fts5", "as_of_unix_ms": rec}),
+        )
+        .expect("temporal recall");
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["total"], json!(1), "temporal recall must surface it: {r}");
+        let item = v["items"][0].to_string();
+        assert!(
+            item.contains("Alice") && !item.contains("Bob"),
+            "must reconstruct the point-in-time (Alice) body, got: {item}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

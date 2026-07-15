@@ -77,6 +77,16 @@ impl EmbeddingCache {
 ///   dense query anyway) — catches inserts, deletes, archive/unarchive.
 /// - `write_gen`: `Database::sig_write_gen`, bumped by the in-place
 ///   emb_sig writers (embed/re-embed/clear) — catches same-count updates.
+/// #619: explicit toggles for `dense_search_with_opts` — env-independent so
+/// tests pin any mode without process-global races. `None` = default
+/// (AUTO for the cache, off for the int4 tiers).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenseOpts {
+    pub use_sig_cache: Option<bool>,
+    pub sig4_resident: Option<bool>,
+    pub sig4_refine: Option<bool>,
+}
+
 struct SigCache {
     ids: Vec<String>,
     /// One CONTIGUOUS buffer of `ids.len() * sig_len` bytes (#619 step 2a):
@@ -89,6 +99,17 @@ struct SigCache {
     /// the dim check, same end state as the old per-row length-mismatch path.
     sigs: Vec<u8>,
     sig_len: usize,
+    /// #619 step 2c′: optional resident int4 tier — the stored `emb_sig4`
+    /// blobs (per-row scale + nibbles) in one contiguous buffer of
+    /// `ids.len() * s4_len` bytes, loaded only when resident int4 coarse is
+    /// requested (~4× the 1-bit buffer; ~390MB at 1M×768-dim). Rows whose
+    /// blob is missing/mismatched are zero-filled AND flagged in
+    /// `s4_missing`, so scoring can rank them via the reservation instead of
+    /// trusting a zeroed slot.
+    s4: Vec<u8>,
+    s4_len: usize,
+    s4_missing: Vec<bool>,
+    has_s4: bool,
     embedded_rows: i64,
     write_gen: u64,
 }
@@ -1835,28 +1856,40 @@ impl Database {
             Some(n) => n,
             None => 50_000,
         };
-        // #619: resident sig cache — full-corpus Hamming prefilter coverage
-        // instead of the first `max_scan` rows (see `SigCache`). Default is
-        // AUTO: the cache engages exactly when the corpus outgrows `max_scan`
-        // — below that the bounded scan already covers every row and behavior
-        // is unchanged; above it, the measured 1M numbers (PRs #652/#654) are
-        // hybrid@1 0.634 → 0.936 at +4ms p50 and dense@5 0.458 → 0.708 for
-        // ~140MB resident. `MIMIR_DENSE_SIG_CACHE` overrides:
+        // #619: resident sig cache — full-corpus prefilter coverage instead
+        // of the first `max_scan` rows (see `SigCache`). Default is AUTO:
+        // the cache engages exactly when the corpus outgrows `max_scan` —
+        // below that the bounded scan already covers every row and behavior
+        // is unchanged. `MIMIR_DENSE_SIG_CACHE` overrides:
         //   unset / "auto" → engage when embedded rows > max_scan
         //   "1"/"true"/"on"   → always (even under the bound; same results,
         //                        trades memory for skipping the SQL sig scan)
         //   "0"/"false"/"off" → never (pre-#655 opt-in behavior)
-        let use_sig_cache: Option<bool> = match std::env::var("MIMIR_DENSE_SIG_CACHE")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "" | "auto" => None,
-            "1" | "true" | "on" => Some(true),
-            _ => Some(false),
+        let tri = |name: &str| -> Option<bool> {
+            match std::env::var(name)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "" | "auto" => None,
+                "1" | "true" | "on" => Some(true),
+                _ => Some(false),
+            }
         };
-        self.dense_search_with_opts(query_vec, limit, max_scan, use_sig_cache)
+        let opts = DenseOpts {
+            use_sig_cache: tri("MIMIR_DENSE_SIG_CACHE"),
+            // #619 step 2c′: resident int4 coarse — ~4× the 1-bit cache
+            // memory (~390MB@1M×768-dim) for ≈⟨q,v⟩-exact candidate
+            // selection. Opt-in; default stays the 96MB 1-bit coarse.
+            sig4_resident: tri("MIMIR_DENSE_SIG4_RESIDENT"),
+            // #619 step 2b, default OFF after the flat 1M measurement
+            // (PR #663: recall unchanged, latency +87%): the disk-fetch int4
+            // refine of a 1-bit coarse pool cannot recover neighbors the
+            // coarse ranking never kept. Env "1" re-enables for A/B.
+            sig4_refine: tri("MIMIR_DENSE_SIG4"),
+        };
+        self.dense_search_with_opts(query_vec, limit, max_scan, opts)
     }
 
     /// The `dense_search` implementation with the scan ceiling as an explicit
@@ -1870,21 +1903,25 @@ impl Database {
         limit: usize,
         max_scan: usize,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
-        self.dense_search_with_opts(query_vec, limit, max_scan, Some(false))
+        self.dense_search_with_opts(
+            query_vec,
+            limit,
+            max_scan,
+            DenseOpts { use_sig_cache: Some(false), ..Default::default() },
+        )
     }
 
-    /// Full-option `dense_search` implementation: scan ceiling AND sig-cache
-    /// toggle as explicit parameters, so tests exercise every mode without
-    /// process-global env races (#617/#627 pattern). `use_sig_cache`:
-    /// `Some(bool)` forces the mode; `None` = AUTO — engage the cache exactly
-    /// when the corpus has outgrown `max_scan`, i.e. when the bounded scan
-    /// would start sampling instead of covering.
+    /// Full-option `dense_search` implementation: scan ceiling AND every
+    /// prefilter toggle as explicit parameters, so tests exercise every mode
+    /// without process-global env races (#617/#627 pattern). `None` fields
+    /// resolve to defaults: `use_sig_cache` → AUTO (engage when the corpus
+    /// outgrows `max_scan`), `sig4_resident` → off, `sig4_refine` → off.
     pub fn dense_search_with_opts(
         &self,
         query_vec: &[f32],
         limit: usize,
         max_scan: usize,
-        use_sig_cache: Option<bool>,
+        opts: DenseOpts,
     ) -> Result<Vec<(Entity, f64)>, Box<dyn std::error::Error>> {
         let conn = self.conn()?;
         let dim = query_vec.len();
@@ -1917,7 +1954,9 @@ impl Database {
         // scan can no longer cover the corpus (under the bound the SQL scan
         // sees every row and results are identical; an unbounded exact scan —
         // max_scan = i64::MAX via MIMIR_DENSE_MAX_SCAN=0 — never auto-caches).
-        let use_sig_cache = use_sig_cache.unwrap_or(embedded_rows > max_scan as i64);
+        let use_sig_cache = opts.use_sig_cache.unwrap_or(embedded_rows > max_scan as i64);
+        let sig4_resident = opts.sig4_resident.unwrap_or(false);
+        let sig4_refine = opts.sig4_refine.unwrap_or(false);
 
         // Phase 1 (#209): lightweight scan — read only id + embedding for scoring.
         // The old query hydrated EVERY candidate (decrypt body, parse tags/links)
@@ -1967,22 +2006,51 @@ impl Database {
                     .lock()
                     .map_err(|_| "sig cache mutex poisoned")?;
                 let stale = match guard.as_ref() {
-                    Some(c) => c.embedded_rows != embedded_rows || c.write_gen != write_gen,
+                    Some(c) => {
+                        c.embedded_rows != embedded_rows
+                            || c.write_gen != write_gen
+                            // #619 2c′: resident int4 requested but this
+                            // cache was built without the tier — rebuild
+                            // loading it.
+                            || (sig4_resident && !c.has_s4)
+                    }
                     None => true,
                 };
                 if stale {
+                    // #619 2c′: fixed int4 stride, probed up front so slot r
+                    // is always `s4[r*s4_len..(r+1)*s4_len]` even when early
+                    // rows lack codes. 0 = no row has codes yet (the resident
+                    // branch then falls back to the 1-bit coarse).
+                    let s4_len: usize = if sig4_resident {
+                        conn.query_row(
+                            "SELECT length(emb_sig4) FROM entities \
+                             WHERE emb_sig4 IS NOT NULL LIMIT 1",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .map(|v| v as usize)
+                        .unwrap_or(0)
+                    } else {
+                        0
+                    };
                     let mut stmt = conn.prepare(
-                        "SELECT id, emb_sig FROM entities \
+                        "SELECT id, emb_sig, emb_sig4 FROM entities \
                          WHERE archived = 0 AND emb_sig IS NOT NULL",
                     )?;
                     let rows = stmt.query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Option<Vec<u8>>>(2)?,
+                        ))
                     })?;
                     let mut ids: Vec<String> = Vec::new();
                     let mut flat: Vec<u8> = Vec::new();
                     let mut sig_len = 0usize;
+                    let mut s4: Vec<u8> = Vec::new();
+                    let mut s4_missing: Vec<bool> = Vec::new();
                     for row in rows {
-                        let (id, sig) = row?;
+                        let (id, sig, sig4) = row?;
                         if sig_len == 0 {
                             sig_len = sig.len();
                         }
@@ -1993,10 +2061,30 @@ impl Database {
                         if sig.len() == sig_len {
                             flat[start..start + sig_len].copy_from_slice(&sig);
                         }
+                        if sig4_resident && s4_len > 0 {
+                            let s = s4.len();
+                            s4.resize(s + s4_len, 0);
+                            match sig4 {
+                                Some(ref b) if b.len() == s4_len => {
+                                    s4[s..s + s4_len].copy_from_slice(b);
+                                    s4_missing.push(false);
+                                }
+                                _ => s4_missing.push(true),
+                            }
+                        }
                         ids.push(id);
                     }
-                    *guard = Some(SigCache { ids, sigs: flat, sig_len,
-                                             embedded_rows, write_gen });
+                    *guard = Some(SigCache {
+                        ids,
+                        sigs: flat,
+                        sig_len,
+                        s4,
+                        s4_len,
+                        s4_missing,
+                        has_s4: sig4_resident,
+                        embedded_rows,
+                        write_gen,
+                    });
                 }
                 let cache = guard.as_ref().expect("sig cache built above");
                 // #619 step 1.5a: the full-corpus prefilter feeds a LARGER
@@ -2030,7 +2118,61 @@ impl Database {
                 );
                 let sl = cache.sig_len.max(1);
                 let row_sig = |r: usize| &cache.sigs[r * sl..(r + 1) * sl];
-                if asym {
+                // 2c′ usability gate: the resident tier only takes over when
+                // a MAJORITY of rows carry codes — on a barely-backfilled
+                // corpus the reservation policy would underfill the pool, so
+                // fall back to the 1-bit coarse until backfill catches up.
+                let s4_usable = sig4_resident && cache.has_s4 && cache.s4_len > 4 && {
+                    let miss = cache.s4_missing.iter().filter(|&&m| m).count();
+                    miss * 2 < n
+                };
+                if s4_usable {
+                    // #619 step 2c′: resident int4 COARSE — the ADC score
+                    // (scale·ΣLUT ≈ ⟨q,v⟩) ranks the whole corpus directly,
+                    // so candidate selection is ≈dot-product-exact instead of
+                    // sign-bit-approximate. This is what the 2b measurement
+                    // demanded: the missing neighbors were outside the 1-bit
+                    // coarse ranking entirely (PR #663), so the coarse stage
+                    // itself must see magnitudes. ~4× the 1-bit memory,
+                    // opt-in. Rows without codes rank via the same reserved
+                    // pool share as the disk refine (never crowded out).
+                    let luts4 = build_sig4_luts(query_vec, cache.s4_len - 4);
+                    let mut scored: Vec<(f32, u32)> = Vec::with_capacity(n);
+                    let mut missing: Vec<u32> = Vec::new();
+                    for r in 0..n {
+                        if cache.s4_missing.get(r).copied().unwrap_or(true) {
+                            missing.push(r as u32);
+                            continue;
+                        }
+                        let slot = &cache.s4[r * cache.s4_len..(r + 1) * cache.s4_len];
+                        match sig4_score(&luts4, slot) {
+                            Some(s) => scored.push((s, r as u32)),
+                            None => missing.push(r as u32),
+                        }
+                    }
+                    let cmp = |a: &(f32, u32), b: &(f32, u32)| {
+                        b.0.partial_cmp(&a.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| {
+                                cache.ids[a.1 as usize].cmp(&cache.ids[b.1 as usize])
+                            })
+                    };
+                    let reserved = missing.len().min((pool / 16).max(1));
+                    let keep = pool.saturating_sub(reserved).max(1).min(scored.len().max(1));
+                    if scored.len() > keep {
+                        scored.select_nth_unstable_by(keep - 1, cmp);
+                        scored.truncate(keep);
+                    }
+                    scored.sort_by(cmp);
+                    let mut ids: Vec<String> = scored
+                        .into_iter()
+                        .map(|(_, i)| cache.ids[i as usize].clone())
+                        .collect();
+                    for r in missing.into_iter().take(reserved) {
+                        ids.push(cache.ids[r as usize].clone());
+                    }
+                    ids
+                } else if asym {
                     // #619 step 2b: two-stage prefilter. The 1-bit asymmetric
                     // score ranks the WHOLE corpus down to a COARSE pool
                     // (default 8×pool clamped [16k, 64k]); the int4 ADC tier
@@ -2041,14 +2183,11 @@ impl Database {
                     // resident (the spec's memory budget). MIMIR_DENSE_SIG4=0
                     // disables the refine (pure step-2a behavior) for A/B;
                     // MIMIR_DENSE_COARSE_POOL overrides the coarse size.
-                    let refine = !matches!(
-                        std::env::var("MIMIR_DENSE_SIG4")
-                            .unwrap_or_default()
-                            .trim()
-                            .to_ascii_lowercase()
-                            .as_str(),
-                        "0" | "false" | "off"
-                    );
+                    // #619 2b default flip (PR #663 measurement): the
+                    // disk-fetch refine is OFF unless explicitly enabled —
+                    // it measured recall-flat at +87% latency because the
+                    // 1-bit coarse ranking is the binding constraint.
+                    let refine = sig4_refine;
                     let coarse = std::env::var("MIMIR_DENSE_COARSE_POOL")
                         .ok()
                         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -17711,17 +17850,17 @@ mod tests {
         let query: Vec<f32> = vec![1.0; dim];
 
         // The SQL path at max_scan=100 cannot reach the 2201st row…
-        let bounded = db.dense_search_with_opts(&query, 5, 100, Some(false)).unwrap();
+        let bounded = db.dense_search_with_opts(&query, 5, 100, DenseOpts { use_sig_cache: Some(false), ..Default::default() }).unwrap();
         assert!(!bounded.iter().any(|(e, _)| e.id == "zzz-hit"));
         // …the cache path finds it despite the same bound: full coverage.
-        let cached = db.dense_search_with_opts(&query, 5, 100, Some(true)).unwrap();
+        let cached = db.dense_search_with_opts(&query, 5, 100, DenseOpts { use_sig_cache: Some(true), ..Default::default() }).unwrap();
         assert_eq!(cached[0].0.id, "zzz-hit", "sig cache must cover the whole corpus");
 
         // Stamp 1 — count change: archiving the hit must evict it on the very
         // next query (the cache rebuilds; archived rows are not in it).
         conn.execute("UPDATE entities SET archived = 1 WHERE id = 'zzz-hit'", [])
             .unwrap();
-        let after_archive = db.dense_search_with_opts(&query, 5, 100, Some(true)).unwrap();
+        let after_archive = db.dense_search_with_opts(&query, 5, 100, DenseOpts { use_sig_cache: Some(true), ..Default::default() }).unwrap();
         assert!(
             !after_archive.iter().any(|(e, _)| e.id == "zzz-hit"),
             "archived row leaked from a stale sig cache"
@@ -17732,7 +17871,7 @@ mod tests {
         // SIG_WRITE_GEN; row count unchanged). The stale cache still holds its
         // old far-away signature — only the gen stamp can catch this.
         Database::store_embedding_with_conn(&conn, "filler-00042", &query).unwrap();
-        let after_reembed = db.dense_search_with_opts(&query, 5, 100, Some(true)).unwrap();
+        let after_reembed = db.dense_search_with_opts(&query, 5, 100, DenseOpts { use_sig_cache: Some(true), ..Default::default() }).unwrap();
         assert_eq!(
             after_reembed[0].0.id, "filler-00042",
             "in-place re-embed missed: SIG_WRITE_GEN stamp failed"
@@ -17808,7 +17947,7 @@ mod tests {
         let mut q = vec![0.01f32; dim];
         q[0] = 1.0;
         // Force the cache path; default scoring is asymmetric (step 2a).
-        let top = db.dense_search_with_opts(&q, 1, 100, Some(true)).unwrap();
+        let top = db.dense_search_with_opts(&q, 1, 100, DenseOpts { use_sig_cache: Some(true), ..Default::default() }).unwrap();
         assert_eq!(
             top[0].0.id, "true-neighbor",
             "asymmetric prefilter must surface the magnitude-dominant true \
@@ -17891,14 +18030,34 @@ mod tests {
         tx.commit().unwrap();
 
         let q = vec![1.0f32; dim];
-        // Force the cache; defaults: asym coarse + int4 refine. limit 1 →
+        // Force the cache + the (post-#663 opt-in) disk refine. limit 1 →
         // pool 512 < 2,501, so the tie-break alone would exile zzz-neighbor.
-        let top = db.dense_search_with_opts(&q, 1, 100, Some(true)).unwrap();
+        let top = db
+            .dense_search_with_opts(&q, 1, 100, DenseOpts {
+                use_sig_cache: Some(true),
+                sig4_refine: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(
             top[0].0.id, "zzz-neighbor",
             "int4 refine must surface the magnitude-dominant neighbor that \
              every 1-bit scoring ties with the decoys (and the id tie-break \
              then exiles)"
+        );
+
+        // #619 step 2c′: the RESIDENT int4 coarse must reach the same answer
+        // with no disk fetch — the ADC score ranks the whole corpus directly.
+        let top = db
+            .dense_search_with_opts(&q, 1, 100, DenseOpts {
+                use_sig_cache: Some(true),
+                sig4_resident: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            top[0].0.id, "zzz-neighbor",
+            "resident int4 coarse must surface the neighbor 1-bit scoring ties away"
         );
 
         let _ = fs::remove_file(&path);
@@ -17956,11 +18115,31 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let results = db.dense_search_with_opts(&query, 5, 100, Some(true)).unwrap();
+        let results = db
+            .dense_search_with_opts(&query, 5, 100, DenseOpts {
+                use_sig_cache: Some(true),
+                sig4_refine: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(
             results[0].0.id, "zzz-nosig4",
             "a NULL-sig4 row must still reach the exact rerank (which then \
              ranks it by its true cosine), not vanish from dense recall"
+        );
+
+        // #619 2c′: same guarantee through the RESIDENT tier — the missing
+        // row rides the reserved pool share instead of vanishing.
+        let results = db
+            .dense_search_with_opts(&query, 5, 100, DenseOpts {
+                use_sig_cache: Some(true),
+                sig4_resident: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            results[0].0.id, "zzz-nosig4",
+            "a NULL-sig4 row must ride the resident tier's reservation to the rerank"
         );
 
         let _ = fs::remove_file(&path);
@@ -18015,7 +18194,7 @@ mod tests {
         let query: Vec<f32> = vec![1.0; dim];
 
         // 2201 rows > max_scan 100: AUTO engages the cache → full coverage.
-        let auto_over = db.dense_search_with_opts(&query, 5, 100, None).unwrap();
+        let auto_over = db.dense_search_with_opts(&query, 5, 100, DenseOpts::default()).unwrap();
         assert_eq!(
             auto_over[0].0.id, "zzz-hit",
             "AUTO must engage the sig cache once the corpus outgrows max_scan"
@@ -18023,8 +18202,8 @@ mod tests {
 
         // max_scan covers the corpus: AUTO stays on the bounded path and the
         // result matches the forced-off bounded scan exactly.
-        let auto_under = db.dense_search_with_opts(&query, 5, 50_000, None).unwrap();
-        let bounded = db.dense_search_with_opts(&query, 5, 50_000, Some(false)).unwrap();
+        let auto_under = db.dense_search_with_opts(&query, 5, 50_000, DenseOpts::default()).unwrap();
+        let bounded = db.dense_search_with_opts(&query, 5, 50_000, DenseOpts { use_sig_cache: Some(false), ..Default::default() }).unwrap();
         let ids = |v: &Vec<(Entity, f64)>| v.iter().map(|(e, _)| e.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&auto_under), ids(&bounded),
                    "AUTO under the bound must be the plain bounded scan");

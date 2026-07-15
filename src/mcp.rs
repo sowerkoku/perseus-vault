@@ -4221,6 +4221,65 @@ fn tool_registry_base() -> &'static Vec<serde_json::Value> {
       }
     },
     "title": "Global Recall (GraphRAG)"
+  },
+  {
+    "name": "mimir_keystone_set",
+    "description": "Author a Keystone — a mandatory policy rule that survives context compaction (#683). Unlike ordinary memories (retrieved when relevant), keystones are fetched deterministically at session start via mimir_keystone_get, merged across scope, and are meant to be obeyed over any conflicting instruction (e.g. 'Every memory write MUST carry a retention class', 'Customer PII MUST NOT cross agent boundaries'). Higher weight wins on contradiction. Re-setting the same (scope, scope_id, content) updates it in place. Every mutation is appended to the cryptographic audit chain. Authoring is gated on trust tier: pass author_trust_tier (>= trust_tier_required, default 2). NOTE: until multi-agent trust tiers land (#684), author_trust_tier is caller-asserted; when omitted the write is allowed and the response flags that enforcement is pending.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "content": { "type": "string", "description": "The policy rule text. Imperative, testable directives work best." },
+        "scope": { "type": "string", "default": "tenant", "description": "Merge scope: 'tenant' (org-wide), 'fleet' (a team), or 'agent' (an individual). Narrower scopes are layered on top of broader ones at get time." },
+        "scope_id": { "type": "string", "description": "Identifier the keystone applies to within a non-tenant scope: the fleet_id ('fleet') or agent_id ('agent'). Omit/empty for tenant scope or 'all in scope'." },
+        "weight": { "type": "number", "default": 1.0, "description": "Conflict-resolution weight; on contradiction the higher-weight keystone wins. Also the merge/sort order returned by keystone_get." },
+        "trust_tier_required": { "type": "integer", "default": 2, "description": "Minimum author trust tier permitted to set/modify this keystone. Defaults to 2 (per #684's tier model: tier 2 = write keystones)." },
+        "author_trust_tier": { "type": "integer", "description": "The authoring agent's trust tier, checked against trust_tier_required. Caller-asserted until #684 wires per-agent trust + session identity." },
+        "agent_id": { "type": "string", "description": "Identity of the authoring agent, stamped on the keystone and its audit-chain event for provenance." },
+        "workspace_hash": { "type": "string", "description": "Optional workspace scope. Keystones with an empty workspace_hash are global (apply everywhere)." }
+      },
+      "required": ["content"]
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "created": { "type": "boolean", "description": "true if a new keystone was created, false if an existing one was updated" },
+        "trust_enforced": { "type": "boolean", "description": "false when author_trust_tier was omitted (enforcement pending #684)" }
+      }
+    },
+    "title": "Set Keystone"
+  },
+  {
+    "name": "mimir_keystone_get",
+    "description": "Fetch the merged Keystones (mandatory policy rules, #683) that apply at session start — the deterministic counterpart to recall. Returns rules ordered by weight (highest first, then scope tenant<fleet<agent, then id) so a renderer can inject them ahead of all other context and resolve contradictions by weight. Filter by scope/scope_id/workspace to get exactly the set an agent must obey. Read-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": { "type": "string", "description": "Optional: restrict to a single scope ('tenant' | 'fleet' | 'agent'). Omit to merge all scopes." },
+        "scope_id": { "type": "string", "description": "Optional: with a non-tenant scope, restrict to this fleet_id/agent_id. Rules with an empty scope_id (scope-wide) are always included." },
+        "workspace_hash": { "type": "string", "description": "Optional workspace scope. Global keystones (empty workspace_hash) are always included." }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "properties": {
+        "keystones": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "content": { "type": "string" },
+              "scope": { "type": "string" },
+              "scope_id": { "type": "string" },
+              "weight": { "type": "number" }
+            }
+          }
+        },
+        "count": { "type": "integer" }
+      }
+    },
+    "title": "Get Keystones"
   }
 ]"###,
         )
@@ -4387,6 +4446,8 @@ fn call_tool(name: &str, db: &Database, args: Value, _id: Option<Value>) -> Stri
         "mimir_traverse" => Ok(tools::handle_traverse(db, args)),
         "mimir_score" => Ok(tools::handle_score(db, args)),
         "mimir_follow" => tools::handle_follow(db, args).map_err(|e| e.to_string()),
+        "mimir_keystone_set" => tools::handle_keystone_set(db, args),
+        "mimir_keystone_get" => tools::handle_keystone_get(db, args),
         "mimir_conflicts" => Ok(tools::handle_conflicts(db, args)),
         "mimir_consolidate" => Ok(tools::handle_consolidate(db, args)),
         "mimir_dream" => tools::handle_dream(db, args),
@@ -4765,6 +4826,100 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64
+    }
+
+    #[test]
+    fn keystone_tools_register_dispatch_order_and_gate() {
+        // #683: keystones are registered (with aliases), round-trip through
+        // call_tool, merge by weight, are updated in place on re-set, gate on
+        // trust tier, and every mutation lands on the audit chain.
+        let db_path = std::env::temp_dir()
+            .join(format!("mimir-keystones-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(db_path.to_str().expect("temp db path")).expect("open temp db");
+
+        // Registered under canonical + both back-compat prefixes.
+        let all = advertised_names(true);
+        for expect in [
+            "mimir_keystone_set",
+            "perseus_vault_keystone_set",
+            "mneme_keystone_get",
+        ] {
+            assert!(all.contains(&expect.to_string()), "missing tool {expect}");
+        }
+
+        // Author two keystones with different weights (author tier satisfies).
+        let low = call_tool(
+            "perseus_vault_keystone_set",
+            &db,
+            json!({"content": "cite source memory IDs", "scope": "tenant",
+                   "weight": 1.0, "author_trust_tier": 2}),
+            None,
+        );
+        assert!(low.contains("\"created\":true"), "{low}");
+        assert!(low.contains("\"trust_enforced\":true"), "{low}");
+        let _ = call_tool(
+            "mimir_keystone_set",
+            &db,
+            json!({"content": "PII MUST NOT cross agent boundaries", "scope": "fleet",
+                   "scope_id": "sec", "weight": 9.0, "author_trust_tier": 3}),
+            None,
+        );
+
+        // get merges both, highest weight first.
+        let got = call_tool("mimir_keystone_get", &db, json!({}), None);
+        let v: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["count"], json!(2), "{got}");
+        assert_eq!(v["keystones"][0]["content"], json!("PII MUST NOT cross agent boundaries"));
+        assert_eq!(v["keystones"][1]["content"], json!("cite source memory IDs"));
+
+        // Re-setting the same (scope, scope_id, content) updates in place.
+        let again = call_tool(
+            "mimir_keystone_set",
+            &db,
+            json!({"content": "cite source memory IDs", "scope": "tenant",
+                   "weight": 5.0, "author_trust_tier": 2}),
+            None,
+        );
+        assert!(again.contains("\"created\":false"), "re-set must update: {again}");
+        let got2 = call_tool("mimir_keystone_get", &db, json!({}), None);
+        let v2: Value = serde_json::from_str(&got2).unwrap();
+        assert_eq!(v2["count"], json!(2), "no duplicate row on re-set: {got2}");
+
+        // Trust gate: asserting tier below required is rejected.
+        let denied = call_tool(
+            "mimir_keystone_set",
+            &db,
+            json!({"content": "denied rule", "author_trust_tier": 1}),
+            None,
+        );
+        assert!(denied.contains("insufficient trust tier"), "{denied}");
+        // Omitting the tier is allowed but flagged as unenforced.
+        let unenforced = call_tool(
+            "mimir_keystone_set",
+            &db,
+            json!({"content": "unenforced rule", "scope": "agent", "scope_id": "a1"}),
+            None,
+        );
+        assert!(unenforced.contains("\"trust_enforced\":false"), "{unenforced}");
+
+        // Every keystone_set is crypto-chained (event_type keystone_set) and the
+        // chain still verifies.
+        let chained: i64 = db
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE event_type = 'keystone_set'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chained, 4, "one audit event per successful set (3 create + 1 update); the trust-denied set emits none");
+        assert!(
+            crate::db::verify_audit_chain(&db).is_ok(),
+            "audit chain must verify after keystone mutations"
+        );
+
+        let _ = fs::remove_file(&db_path);
     }
 
     #[test]

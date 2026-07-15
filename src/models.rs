@@ -177,6 +177,23 @@ fn default_event_type() -> String {
     "decision".to_string()
 }
 
+/// #683: a Keystone — a mandatory policy rule fetched deterministically at
+/// session start and obeyed over conflicting instructions. Merged across scope
+/// (tenant < fleet < agent) with weight-based conflict resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Keystone {
+    pub id: String,
+    pub content: String,
+    pub scope: String,
+    pub scope_id: String,
+    pub weight: f64,
+    pub trust_tier_required: i64,
+    pub workspace_hash: String,
+    pub author_agent_id: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
 /// A key-value state entry with optional TTL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateEntry {

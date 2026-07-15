@@ -191,6 +191,28 @@ CREATE TABLE IF NOT EXISTS entity_history (
 
 CREATE INDEX IF NOT EXISTS idx_entity_history_id ON entity_history(id);
 CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category, key, invalidated_at_unix_ms);
+
+-- #683 Keystones: mandatory policy rules, fetched deterministically at session
+-- start (mimir_keystone_get) and obeyed over conflicting instructions. Merged
+-- across scope (tenant < fleet < agent) with weight-based conflict resolution.
+-- UNIQUE(scope, scope_id, content, workspace_hash) makes re-setting the same
+-- rule an in-place update rather than a duplicate. Mutations are appended to
+-- the cryptographic audit chain (like entity ops).
+CREATE TABLE IF NOT EXISTS keystones (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'tenant',
+    scope_id TEXT NOT NULL DEFAULT '',
+    weight REAL NOT NULL DEFAULT 1.0,
+    trust_tier_required INTEGER NOT NULL DEFAULT 2,
+    workspace_hash TEXT NOT NULL DEFAULT '',
+    author_agent_id TEXT NOT NULL DEFAULT '',
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL,
+    UNIQUE(scope, scope_id, content, workspace_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_keystones_scope
+    ON keystones(workspace_hash, scope, scope_id, weight);
 ";
 
 /// Current schema migration level, stamped into `PRAGMA user_version` once all
@@ -232,7 +254,11 @@ CREATE INDEX IF NOT EXISTS idx_entity_history_catkey ON entity_history(category,
 /// coarse prefilter and the exact rerank, plus its covering index. Backfilled
 /// from stored vectors at migration; writers maintain the column alongside
 /// embedding/emb_sig.
-const SCHEMA_VERSION: i64 = 19;
+/// v21 (#683 Keystones): the `keystones` table (mandatory policy rules).
+/// Created idempotently; no backfill (new table). NOTE: v20 is #682's
+/// `entity_history_fts` — this PR is developed in parallel; whichever lands
+/// second keeps both migration blocks and the higher version number.
+const SCHEMA_VERSION: i64 = 21;
 
 /// Initialize the v0.2.0 schema on a fresh database.
 pub fn initialize_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -720,6 +746,30 @@ fn apply_migrations(conn: &Connection) -> Result<(), Box<dyn std::error::Error>>
            ON entities(id, emb_sig4) WHERE emb_sig4 IS NOT NULL;",
     )?;
     // ── end v19 ──────────────────────────────────────────────────────────
+
+    // ── v21 (#683 Keystones): mandatory policy rules table ───────────────
+    // New table (the base DDL also has this IF NOT EXISTS create for fresh
+    // DBs). No backfill — there is nothing to migrate. (v20 = #682's
+    // entity_history_fts, developed in parallel; kept distinct so the two can
+    // land in either order.)
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS keystones (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT 'tenant',
+            scope_id TEXT NOT NULL DEFAULT '',
+            weight REAL NOT NULL DEFAULT 1.0,
+            trust_tier_required INTEGER NOT NULL DEFAULT 2,
+            workspace_hash TEXT NOT NULL DEFAULT '',
+            author_agent_id TEXT NOT NULL DEFAULT '',
+            created_at_unix_ms INTEGER NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL,
+            UNIQUE(scope, scope_id, content, workspace_hash)
+         );
+         CREATE INDEX IF NOT EXISTS idx_keystones_scope
+            ON keystones(workspace_hash, scope, scope_id, weight);",
+    )?;
+    // ── end v21 ──────────────────────────────────────────────────────────
 
     // Stamp the migration level so subsequent opens skip the probe block above.
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

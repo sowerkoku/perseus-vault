@@ -2966,6 +2966,107 @@ pub fn handle_follow(db: &Database, args: Value) -> Result<String, String> {
     serde_json::to_string(&report).map_err(|e| format!("Serialization failed: {}", e))
 }
 
+// ── #683 Keystones: mandatory policy rules ───────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct KeystoneSetArgs {
+    pub content: String,
+    #[serde(default = "default_keystone_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub scope_id: String,
+    #[serde(default = "default_keystone_weight")]
+    pub weight: f64,
+    #[serde(default = "default_keystone_tier_required")]
+    pub trust_tier_required: i64,
+    /// Caller-asserted authoring tier. Until #684 wires per-agent trust +
+    /// session identity, this is honor-system: when present it is enforced,
+    /// when absent authoring is allowed and the response flags it.
+    #[serde(default)]
+    pub author_trust_tier: Option<i64>,
+    #[serde(default)]
+    pub workspace_hash: String,
+    #[serde(default)]
+    pub agent_id: String,
+}
+
+fn default_keystone_scope() -> String {
+    "tenant".to_string()
+}
+fn default_keystone_weight() -> f64 {
+    1.0
+}
+fn default_keystone_tier_required() -> i64 {
+    2
+}
+
+pub fn handle_keystone_set(db: &Database, args: Value) -> Result<String, String> {
+    let a: KeystoneSetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid keystone_set arguments: {}", e))?;
+    // #683/#684 trust gating. `author_trust_tier` is caller-asserted until #684
+    // provides a per-agent trust registry + transport session identity; when
+    // supplied it is enforced, when omitted the write proceeds and the response
+    // sets trust_enforced=false so callers know enforcement is pending.
+    let trust_enforced = a.author_trust_tier.is_some();
+    if let Some(t) = a.author_trust_tier {
+        if t < a.trust_tier_required {
+            return Err(format!(
+                "insufficient trust tier: authoring this keystone requires tier >= {}, caller asserted {}",
+                a.trust_tier_required, t
+            ));
+        }
+    }
+    let (id, created) = db
+        .keystone_set(
+            &a.content,
+            &a.scope,
+            &a.scope_id,
+            a.weight,
+            a.trust_tier_required,
+            &a.workspace_hash,
+            &a.agent_id,
+        )
+        .map_err(|e| format!("keystone_set failed: {}", e))?;
+    Ok(json!({ "id": id, "created": created, "trust_enforced": trust_enforced }).to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KeystoneGetArgs {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub scope_id: Option<String>,
+    #[serde(default)]
+    pub workspace_hash: Option<String>,
+}
+
+pub fn handle_keystone_get(db: &Database, args: Value) -> Result<String, String> {
+    let a: KeystoneGetArgs = serde_json::from_value(args)
+        .map_err(|e| format!("Invalid keystone_get arguments: {}", e))?;
+    let keystones = db
+        .keystone_get(
+            a.scope.as_deref(),
+            a.scope_id.as_deref(),
+            a.workspace_hash.as_deref(),
+        )
+        .map_err(|e| format!("keystone_get failed: {}", e))?;
+    let items: Vec<Value> = keystones
+        .iter()
+        .map(|k| {
+            json!({
+                "id": k.id,
+                "content": k.content,
+                "scope": k.scope,
+                "scope_id": k.scope_id,
+                "weight": k.weight,
+                "trust_tier_required": k.trust_tier_required,
+                "workspace_hash": k.workspace_hash,
+            })
+        })
+        .collect();
+    Ok(json!({ "keystones": items, "count": items.len() }).to_string())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ConflictArgs {
     pub category: String,

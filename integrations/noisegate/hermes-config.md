@@ -1,48 +1,59 @@
-# Hermes + Perseus Vault + Noisegate — Full Context Budget Stack
+# Hermes + Perseus Vault + Noisegate
 
-Copy-paste into your Hermes `config.yaml` to wire all three together.
-Perseus handles context injection (AGENTS.md rendering). Noisegate handles
-runtime tool-output compaction (MCP tool results are preserved verbatim by default).
+Perseus Vault provides read-only **pre-turn context**; Noisegate compacts noisy
+**runtime** tool/terminal output. They compose with **no runtime dependency**
+between them.
 
-## 1. MCP server config
+## Install
+
+- **Perseus Vault** — a single Rust binary (`perseus-vault`). Download a release
+  or build from source and put it on `PATH`.
+- **Noisegate** (Hermes plugin) — the PyPI package is **`noisegate-hermes`**
+  (NOT `noisegate`, which is an unrelated project). Install/update with:
+  ```sh
+  uvx --from noisegate-hermes noisegate install-hermes
+  ```
+
+## MCP server config (Hermes)
 
 ```yaml
 mcp_servers:
   perseus-vault:
     command: perseus-vault
-    args: ["serve", "--db", "~/.perseus-vault/data/perseus-vault.db"]
-    transport: stdio
+    args: ["serve", "--db", "${HOME}/.perseus-vault/data/perseus-vault.db"]
 ```
 
-## 2. Noisegate plugin
+Notes:
+- Hermes interpolates `${HOME}` in MCP args but does **not** expand a literal `~`
+  inside an argument — use `${HOME}` or an absolute path.
+- `transport: stdio` is implied when `command`/`args` are present; omit it.
 
-```bash
-pip install noisegate
-noisegate init
+## Pre-turn context (optional)
+
+Registering the MCP server exposes the tools — it does **not** by itself render
+AGENTS.md or inject context. To push pre-turn memory into the prompt, run the
+read-only `prepare` surface from a session-start hook/plugin that returns the
+prepared context:
+
+```sh
+perseus-vault prepare --task "<current task>" --db "${HOME}/.perseus-vault/data/perseus-vault.db"
 ```
 
-Noisegate hooks into `transform_tool_result` and `transform_terminal_output`.
-It already preserves MCP/memory-tool results verbatim. Perseus Vault tools are
-MCP tools — they get preservation automatically. No additional config needed.
+`prepare` is read-only (no writes) and designed to run every turn; see
+[`fixtures.md`](./fixtures.md) for its output contract and
+[`prepare_output.golden.json`](./prepare_output.golden.json) for a real sample.
 
-The compatibility contract is defined by the fixtures at `integrations/noisegate/fixtures.md`.
-Noisegate's byte-exact compatibility tests verify that Perseus Vault's MCP tool
-responses pass through unmodified.
+## How it composes
 
-## 3. Session start hook (optional)
+1. Pre-turn: a hook runs `perseus-vault prepare` and injects the resulting
+   `<memory-prep>` / context block into the system prompt.
+2. Runtime: tool and terminal output flows through Noisegate's compaction.
+   Noisegate leaves `mcp__*` tool results untouched, so Perseus Vault's MCP tool
+   responses pass through unmodified with no Perseus-specific rule.
 
-```yaml
-hooks:
-  pre_llm_call:
-    - command: "perseus-vault write --category system --key session-start --body '{\"agent\":\"hermes\"}' --tags session-start"
-      timeout: 5
-```
+## Compatibility contract
 
-## What this does
-
-1. Agent starts → Perseus Vault renders AGENTS.md context via `perseus_vault_context`
-2. Agent works → tools produce output that flows through Noisegate's `transform_terminal_output` hook
-3. Noisegate compacts noisy tool output → MCP tool results (including Perseus Vault) preserved verbatim
-4. Agent stays focused on signal, both input and output sides
-
-Both projects remain independently usable. No runtime dependency between them.
+The stable, regenerable output contract lives in [`fixtures.md`](./fixtures.md)
+/ [`prepare_output.golden.json`](./prepare_output.golden.json). Note: Noisegate
+does not currently ship Perseus-specific compatibility tests — don't claim it
+does.

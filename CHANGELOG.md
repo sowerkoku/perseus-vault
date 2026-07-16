@@ -6,6 +6,20 @@ All notable changes to Perseus Vault (formerly Mimir/Mneme) are documented here.
 ## [Unreleased]
 
 ### Added
+- **BEAM — bi-temporal correctness + determinism at scale** (#685). A new
+  harness (`benchmark/beam/`) that embeds the CI-verified bi-temporal gauntlet
+  inside a filler corpus sized to the BEAM token tiers (128K / 500K / 1M / 10M)
+  and asserts, at every tier: correctness holds (gauntlet still 13/13),
+  results are deterministic (two independent runs → identical signature), and
+  per-axis point-lookup latency stays under budget. It **reuses**
+  `gauntlet.run_scenarios` / `build_report` verbatim (one source of temporal
+  truth — the gauntlet's `main` was refactored to call the same extracted
+  functions, output unchanged), so BEAM can only ever agree with the gauntlet's
+  verdicts. Ships with a CI gate (`gate.py`), a methodology `README.md`, and a
+  binary-free `--self-test` for the corpus/token logic. Fully offline,
+  seeded/deterministic corpus. Published tier numbers come from a run on named
+  hardware (the heavy 1M/10M tiers on the benchmark fleet) — captured in a
+  signed `report.json`, never hand-written.
 - **Multi-agent scoping — trust tiers + visibility enforcement** (#684). A new
   `agents` registry (schema v22: `agent_id`, `name`, `trust_tier` 0-3,
   `fleet_id`) plus the `mimir_agent` tool to register/look up agents.

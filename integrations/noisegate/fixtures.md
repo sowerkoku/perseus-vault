@@ -38,7 +38,6 @@ ordered by relevance. Supports temporal filtering via `as_of_unix_ms`,
             "status": "active",
             "entity_type": "insight",
             "tags": ["database", "architecture", "migrations"],
-            "importance": 0.95,
             "decay_score": 0.92,
             "retrieval_count": 17,
             "layer": "core",
@@ -56,7 +55,6 @@ ordered by relevance. Supports temporal filtering via `as_of_unix_ms`,
             "status": "active",
             "entity_type": "insight",
             "tags": ["api", "architecture", "rust"],
-            "importance": 0.90,
             "decay_score": 0.88,
             "retrieval_count": 12,
             "layer": "core",
@@ -78,14 +76,11 @@ ordered by relevance. Supports temporal filtering via `as_of_unix_ms`,
     "items": [],
     "total": 0,
     "diagnostic": {
-        "reason": "no_matching_entities",
-        "categories_searched": ["insight", "plan", "observation"],
-        "index_size": 1427,
-        "query_terms": ["deployment", "kubernetes"],
-        "filters_applied": {
-            "workspace_hash": "proj_infra",
-            "status": "active"
-        }
+        "reason": "no_match",
+        "hint": "the store is populated and the backend is healthy — this query simply had no matches; broaden the query or mode before assuming a fault",
+        "active_memories": 1427,
+        "embedded_memories": 512,
+        "semantic_recall": true
     }
 }
 ```
@@ -106,7 +101,6 @@ flag and `next_cursor` for pagination.
             "status": "active",
             "entity_type": "insight",
             "tags": ["database", "architecture"],
-            "importance": 0.95,
             "decay_score": 0.92,
             "retrieval_count": 17,
             "layer": "core",
@@ -123,7 +117,6 @@ flag and `next_cursor` for pagination.
             "status": "active",
             "entity_type": "insight",
             "tags": ["api", "architecture"],
-            "importance": 0.90,
             "decay_score": 0.88,
             "retrieval_count": 12,
             "layer": "core",

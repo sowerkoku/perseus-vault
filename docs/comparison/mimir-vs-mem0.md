@@ -31,6 +31,37 @@ On this corpus Perseus Vault's hybrid retrieval (BM25 + dense + RRF) recovers ev
 fact where Mem0's vector-only search misses on intent/paraphrase queries. Full
 artifact: [`benchmark/lambda/results/competitors.json`](../../benchmark/lambda/results/competitors.json).
 
+## Measured: LOCOMO head-to-head (their own harness)
+
+LOCOMO long-term conversational-memory benchmark, run on **mem0's own harness**
+([our fork](https://github.com/Perseus-Computing-LLC/memory-benchmarks) of
+`mem0ai/memory-benchmarks`), not a home-grown script. Categories 1–4, 1,540
+questions, top-200 retrieval, gpt-5 answerer + judge (OpenAI), 2026-07-22:
+
+| System | Overall | Single | Temporal | Multi | Open-domain |
+|---|---|---|---|---|---|
+| **Perseus Vault 2.20.2** (`e1e7d51`) | **87.9%** | 89.1 | 92.2 | 85.1 | 70.8 |
+| Mem0 Platform Starter (measured) | 82.2% | 85.0 | 82.9 | 78.0 | 67.7 |
+| Zep Cloud Flex (measured) | 33.8% | 36.9 | 6.9 | 50.0 | 49.0 |
+| Mem0's own published file (Apr 2026, azure gpt-5) | 91.6% | 92.3 | 92.8 | 93.3 | 76.0 |
+
+Category 5 (adversarial, 446 questions, top-200): **Perseus Vault 63.5%**,
+Mem0 55.6%, Zep 49.8%. Mem0's stock harness cannot run category 5 (it crashes
+on `qa["answer"]`); our fork added the official LOCOMO adversarial grading.
+
+Disclosures:
+
+- Our Mem0 measurement (82.2%) is **9.4 points below** Mem0's own published
+  file (91.6%) — judge/platform drift between their April 2026 azure run and
+  our July 2026 OpenAI run. Both numbers are published in the fork.
+- Own-build regression: the previous Perseus Vault build (`df43975`) scored
+  89.5%; the current build (`e1e7d51`) scores 87.9%. Disclosed in the fork.
+- Time-to-searchable: Perseus Vault is a fully local single binary — instant.
+  Mem0 Platform took ~11–45s per session in our runs.
+
+Full per-question results, configs, and judge outputs:
+**[memory-benchmarks / LEADERBOARD.md](https://github.com/Perseus-Computing-LLC/memory-benchmarks)**
+
 ## When to Use Perseus Vault
 
 - You want a **single binary** with no infrastructure

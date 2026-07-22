@@ -135,6 +135,18 @@ Recall quality measured on LongMemEval's **official** harness, not a home-grown 
 
 `longmemeval_s` (500 questions), gpt-4o-2024-08-06 answerer + LongMemEval's official judge; competitor numbers are their published values. Perseus Vault's 73.8% is the plain mean of 3 runs; 79.0% with official CoT. [Methodology & content-hashed (sha256) results →](benchmark/longmemeval/COMPARISON.md)
 
+### LOCOMO (mem0's own harness)
+
+Measured on mem0's own LOCOMO harness ([our fork](https://github.com/Perseus-Computing-LLC/memory-benchmarks)), not ours — cats 1–4, 1,540q, top-200, gpt-5 answerer + judge:
+
+| Engine | Overall | Single | Temporal | Multi | Open-domain |
+|---|---|---|---|---|---|
+| **Perseus Vault 2.20.2** | **87.9%** | 89.1 | 92.2 | 85.1 | 70.8 |
+| Mem0 Platform Starter | 82.2% | 85.0 | 82.9 | 78.0 | 67.7 |
+| Zep Cloud Flex | 33.8% | 36.9 | 6.9 | 50.0 | 49.0 |
+
+Cat-5 adversarial (446q): Perseus 63.5, Mem0 55.6, Zep 49.8. Our Mem0 measurement is 9.4pts below their published file (judge/platform drift — disclosed). [Full leaderboard →](https://github.com/Perseus-Computing-LLC/memory-benchmarks)
+
 ### Bi-temporal time-travel (three-axis)
 
 Our strongest structural differentiator — full **SQL:2011 bi-temporal** history
